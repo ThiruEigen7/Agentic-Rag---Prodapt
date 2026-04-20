@@ -1,1 +1,9 @@
-
+sentence-transformers
+faiss-cpu
+numpy
+pdfplumber
+python-dotenv
+tqdm
+tavily-python
+openpyxl
+pandas
