@@ -27,6 +27,7 @@ import sys
 import sqlite3
 from pathlib import Path
 import warnings
+import time
 
 # Suppress FutureWarning about google.generativeai deprecation
 warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
@@ -104,28 +105,50 @@ Database schema:
 
 
 # ── step 1: natural language → SQL ───────────────────────────────────────────
-def _generate_sql(question: str) -> str:
+def _generate_sql(question: str, max_retries: int = 3) -> str:
     """
     Call Gemini to convert natural language question to a SQL SELECT query.
+    Includes retry logic with exponential backoff for rate limits.
     Returns raw SQL string.
     """
     model = genai.GenerativeModel(LLM_MODEL)
-
-    response = model.generate_content(
-        f"{SQL_SYSTEM_PROMPT.format(schema=DB_SCHEMA)}\n\nQuestion: {question}\nSQL:"
-    )
-
-    sql = response.text.strip()
-
-    # strip markdown code fences if LLM adds them despite instructions
-    if sql.startswith("```"):
-        lines = sql.split("\n")
-        sql   = "\n".join(
-            line for line in lines
-            if not line.startswith("```")
-        ).strip()
-
-    return sql
+    
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(
+                f"{SQL_SYSTEM_PROMPT.format(schema=DB_SCHEMA)}\n\nQuestion: {question}\nSQL:"
+            )
+            
+            sql = response.text.strip()
+            
+            # strip markdown code fences if LLM adds them despite instructions
+            if sql.startswith("```"):
+                lines = sql.split("\n")
+                sql   = "\n".join(
+                    line for line in lines
+                    if not line.startswith("```")
+                ).strip()
+            
+            return sql
+            
+        except Exception as e:
+            error_msg = str(e)
+            
+            # Check if it's a rate limit error (503, 429, or UNAVAILABLE)
+            is_rate_limit = any(code in error_msg for code in ["503", "429", "UNAVAILABLE", "overloaded"])
+            
+            if is_rate_limit and attempt < max_retries - 1:
+                # Calculate exponential backoff: 2^attempt seconds
+                wait_time = 2 ** attempt
+                print(f"  ⏳ Rate limited. Retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})...", file=sys.stderr)
+                time.sleep(wait_time)
+                continue
+            else:
+                # Not a rate limit error, or last attempt failed
+                raise e
+    
+    # Should not reach here
+    raise Exception(f"Failed to generate SQL after {max_retries} attempts")
 
 
 # ── step 2: execute SQL ───────────────────────────────────────────────────────
