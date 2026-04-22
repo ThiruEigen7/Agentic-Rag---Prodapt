@@ -42,7 +42,7 @@ load_dotenv()
 # ── config ────────────────────────────────────────────────────────────────────
 MAX_STEPS     = 8           # hard cap — never change this
 TRACES_DIR    = Path("traces")
-GEMINI_MODEL  = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")   # free tier
+GEMINI_MODEL  = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")   # free tier
 
 COMPANY_KEYWORDS = {
     "infosys"    : "Infosys",
@@ -50,6 +50,41 @@ COMPANY_KEYWORDS = {
     "cognizant"  : "Cognizant",
     "cts"        : "Cognizant",
 }
+
+
+# ── single source of truth about what data exists ─────────────────────────────
+# Update this block whenever your corpus or DB changes.
+# Every prompt references DATA_CONTEXT so the LLM always knows what's available.
+DATA_CONTEXT = """
+AVAILABLE DATA SOURCES:
+
+1. search_docs — Annual Report PDFs (qualitative text):
+   Companies : Infosys, Accenture, Cognizant
+   Years     : FY22, FY23, FY24, FY25
+   Contains  : MD&A commentary, CEO letters, strategic priorities, business segment
+               descriptions, risk factors, operational highlights, headcount narrative,
+               deal wins, AI/cloud strategy, margin explanation text
+
+2. query_data — Structured Financial Database (numbers):
+   Companies : Infosys, Accenture, Cognizant
+   Years     : FY22, FY23, FY24, FY25
+   Columns   : company, fiscal_year, quarter, revenue_bn_USD, op_margin_pct,
+               headcount, epsusd, source_link, notes
+   Contains  : revenue (USD billions), operating margin %, headcount,
+               EPS (USD), quarterly and annual breakdowns
+
+3. web_search — Live Web (real-time):
+   Contains  : current stock prices, analyst ratings, news from last 90 days,
+               earnings releases beyond FY25, leadership changes, deal announcements
+   Use when  : question asks for "current", "today", "latest", "recent",
+               or any period BEYOND FY25
+
+ROUTING RULES:
+- FY22, FY23, FY24, FY25 EXISTS in search_docs and query_data — always use those first
+- "Latest" or "current" financials = FY25 → query_data or search_docs
+- Only use web_search for live prices, news, or data beyond FY25
+- NEVER say data is unavailable for FY22-FY25 — it is in the database
+"""
 
 # ── exceptions ────────────────────────────────────────────────────────────────
 class HardCapExceeded(Exception):
@@ -96,39 +131,23 @@ def _get_client() -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
-def _llm(prompt: str, max_retries: int = 3) -> str:
-    """Single Gemini call with retry logic for rate limits. Returns response text stripped of whitespace."""
-    client = _get_client()
-    
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model    = GEMINI_MODEL,
-                contents = prompt,
-            )
-            return response.text.strip()
-        except Exception as e:
-            error_msg = str(e)
-            is_rate_limit = any(code in error_msg for code in ["503", "429", "UNAVAILABLE", "overloaded"])
-            
-            if is_rate_limit and attempt < max_retries - 1:
-                wait_time = 2 ** attempt
-                print(f"⏳ Rate limited. Retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})...", file=sys.stderr)
-                time.sleep(wait_time)
-                continue
-            else:
-                raise e
-    
-    raise Exception(f"Failed after {max_retries} attempts")
+def _llm(prompt: str) -> str:
+    """Single Gemini call. Returns response text stripped of whitespace."""
+    client   = _get_client()
+    response = client.models.generate_content(
+        model    = GEMINI_MODEL,
+        contents = prompt,
+    )
+    return response.text.strip()
 
 
-def _llm_json(prompt: str, max_retries: int = 3) -> dict:
+def _llm_json(prompt: str) -> dict:
     """
-    Gemini call expecting JSON output with retry logic.
+    Gemini call expecting JSON output.
     Strips markdown fences if model adds them despite instructions.
     Falls back to empty dict on parse failure.
     """
-    raw = _llm(prompt, max_retries=max_retries)
+    raw = _llm(prompt)
     # strip ```json ... ``` fences
     if raw.startswith("```"):
         lines = [l for l in raw.split("\n") if not l.strip().startswith("```")]
@@ -163,24 +182,41 @@ Rewritten query:"""
 
 
 # ── pre-loop step ②: gate — trivial / refuse / proceed ───────────────────────
-GATE_PROMPT = """Classify this question into exactly one of three categories:
+GATE_PROMPT = """You are a classifier for a financial data agent.
 
-TRIVIAL  — can be answered directly without any data (e.g. "what is 2+2", "what year is it")
-REFUSE   — must be declined (financial advice, investment recommendations, predictions,
-           or anything harmful or out of scope)
-PROCEED  — needs tool use to answer from company data
+Classify this question into exactly one of three categories:
 
-Respond with ONLY valid JSON, no explanation, no markdown:
+TRIVIAL  — answerable directly with no data lookup (math, general knowledge, greetings)
+           e.g. "what is 2+2", "what does EPS mean", "hello"
+
+REFUSE   — must be declined: investment advice ("should I buy X"), predictions beyond
+           available data (FY26+), or harmful/irrelevant requests
+           e.g. "should I invest in Accenture", "will revenue grow in FY27"
+
+PROCEED  — needs tool use to answer from company data (everything else)
+           e.g. ANY question about Infosys / Accenture / Cognizant facts, numbers,
+           strategy, comparisons, trends for FY22-FY25
+
+{DATA_CONTEXT}
+
+CRITICAL: The following ALWAYS map to PROCEED:
+  - Any FY22 / FY23 / FY24 / FY25 question → data EXISTS, use tools
+  - "Compare X and Y" questions → PROCEED
+  - "What is the operating margin / revenue / headcount" → PROCEED
+  - "Latest" or "current" financials → PROCEED (FY25 is in the database)
+  - "Current stock price / analyst rating" → PROCEED (use web_search)
+
+Respond with ONLY valid JSON — no markdown, no explanation:
 {{"decision": "TRIVIAL"|"REFUSE"|"PROCEED", "reason": "one sentence"}}
 
-Question: {question}"""
+Question: {{question}}"""
 
 def gate_check(question: str) -> tuple[str, str]:
     """
     Returns (decision, reason).
     decision: "TRIVIAL" | "REFUSE" | "PROCEED"
     """
-    result = _llm_json(GATE_PROMPT.format(question=question))
+    result = _llm_json(GATE_PROMPT.format(DATA_CONTEXT=DATA_CONTEXT, question=question))
     decision = result.get("decision", "PROCEED").upper()
     reason   = result.get("reason", "")
     if decision not in ("TRIVIAL", "REFUSE", "PROCEED"):
@@ -189,27 +225,39 @@ def gate_check(question: str) -> tuple[str, str]:
 
 
 # ── pre-loop step ③: planning ─────────────────────────────────────────────────
-PLAN_PROMPT = """You are an agent that answers questions about company financials using three tools.
+PLAN_PROMPT = """You are planning tool calls for a financial data agent.
 
-TOOLS AVAILABLE:
-  search_docs  — searches annual report PDFs (qualitative: strategy, commentary, explanations)
-  query_data   — queries structured financial database (quantitative: revenue, margin, headcount, EPS)
-  web_search   — searches live web (recent news, current stock prices, latest earnings)
+{DATA_CONTEXT}
 
-Write a short plan (1-2 sentences) describing:
-  1. Which tool(s) you will use and in what order
-  2. Why each tool is needed
+TOOL SELECTION GUIDE:
+  search_docs  → use for WHY / HOW / WHAT STRATEGY questions
+                 e.g. "why did margin improve", "what did CEO say", "AI strategy"
+                 Searches: Infosys FY22-FY25, Accenture FY22-FY25, Cognizant FY22-FY25 annual reports
 
-Respond with ONLY valid JSON:
-{{"plan": "...", "first_tool": "search_docs"|"query_data"|"web_search", "first_input": "..."}}
+  query_data   → use for NUMBERS / METRICS / COMPARISONS questions
+                 e.g. "revenue in FY25", "compare margins", "headcount trend"
+                 Database has: revenue_bn_USD, op_margin_pct, headcount, epsusd for FY22-FY25
 
-Question: {question}"""
+  web_search   → use ONLY for live/current data not in database
+                 e.g. "current stock price", "today's analyst rating", "news this week"
+                 Do NOT use for any FY22-FY25 historical data — that's in the database
+
+MULTI-TOOL STRATEGY:
+  "Compare margins AND explain why" → query_data first (numbers), then search_docs (explanation)
+  "Revenue trend AND current price"  → query_data first (history), then web_search (live price)
+  "What did Infosys say about AI"    → search_docs only (qualitative)
+  "Operating margin FY24 vs FY25"    → query_data only (both years in database)
+
+Write a 1-2 sentence plan, then output ONLY valid JSON:
+{{"plan": "...", "first_tool": "search_docs"|"query_data"|"web_search", "first_input": "short specific query string"}}
+
+Question: {{question}}"""
 
 def make_plan(question: str) -> tuple[str, str, str]:
     """
     Returns (plan_text, first_tool, first_input).
     """
-    result     = _llm_json(PLAN_PROMPT.format(question=question))
+    result     = _llm_json(PLAN_PROMPT.format(DATA_CONTEXT=DATA_CONTEXT, question=question))
     plan       = result.get("plan", "")
     first_tool = result.get("first_tool", "query_data")
     first_input= result.get("first_input", question)
@@ -219,26 +267,32 @@ def make_plan(question: str) -> tuple[str, str, str]:
 
 
 # ── loop step ④: tool selection ───────────────────────────────────────────────
-TOOL_SELECT_PROMPT = """You are an agent answering a question about company financials.
+TOOL_SELECT_PROMPT = """You are deciding the next tool call for a financial data agent.
 
-TOOLS:
-  search_docs  — annual report PDFs: strategy, management commentary, explanations, qualitative info
-  query_data   — structured database: revenue, operating margin, net profit, EPS, headcount (FY21-FY24)
-  web_search   — live web: current prices, recent news, latest earnings, analyst ratings
+{DATA_CONTEXT}
 
-QUESTION: {question}
+DECISION RULES — follow strictly:
+  query_data   → numbers, metrics, comparisons, trends (revenue, margin, headcount, EPS)
+                 ALWAYS try this first for any FY22-FY25 numeric question
+  search_docs  → qualitative text: strategy, explanations, CEO commentary, MD&A
+                 Use after query_data when answer also needs "why" or "how"
+  web_search   → ONLY for: current stock price, live analyst rating, news beyond FY25
+                 Do NOT use web_search for FY22-FY25 data — it is in the database
+  DONE         → context already contains a complete answer — stop calling tools
+
+QUESTION: {{question}}
 
 CONTEXT COLLECTED SO FAR:
-{context}
+{{context}}
 
-Decide the next tool to call. Respond with ONLY valid JSON:
-{{"tool": "search_docs"|"query_data"|"web_search", "input": "exact query to pass to the tool"}}
+What is the NEXT best tool to call?
+- If context has the answer already → {{"tool": "DONE", "input": ""}}
+- If context has numbers but no explanation → {{"tool": "search_docs", "input": "..."}}
+- If context is empty and question needs numbers → {{"tool": "query_data", "input": "..."}}
+- If question needs live/current data → {{"tool": "web_search", "input": "short query"}}
 
-Rules:
-- If question asks for numbers/metrics → query_data
-- If question asks for explanations/strategy/commentary → search_docs
-- If question asks for current/live/recent info → web_search
-- If context already has enough info, output: {{"tool": "DONE", "input": ""}}"""
+Output ONLY valid JSON — no markdown, no explanation:
+{{"tool": "search_docs"|"query_data"|"web_search"|"DONE", "input": "exact query string"}}"""
 
 def select_tool(question: str, context: str) -> tuple[str, str]:
     """
@@ -246,7 +300,7 @@ def select_tool(question: str, context: str) -> tuple[str, str]:
     tool_name can be "DONE" meaning agent has enough to answer.
     """
     result     = _llm_json(TOOL_SELECT_PROMPT.format(
-        question=question, context=context
+        DATA_CONTEXT=DATA_CONTEXT, question=question, context=context
     ))
     tool       = result.get("tool", "query_data")
     tool_input = result.get("input", question)
@@ -292,21 +346,30 @@ def execute_tool(tool: str, tool_input: str, question: str) -> dict:
 # ── loop step ⑤: relevance / sufficiency check ─────────────────────────────
 SUFFICIENCY_PROMPT = """You are checking whether enough information has been collected to answer a question.
 
-QUESTION: {question}
+QUESTION: {{question}}
 
 CONTEXT COLLECTED:
-{context}
+{{context}}
 
 Is the context sufficient to write a complete, accurate, cited answer?
 
-Rules:
-- If numbers are needed and present → sufficient
-- If explanation is needed and present → sufficient
-- If any key part of the question is still unanswered → not sufficient
-- If tool returned an error or empty result → not sufficient
+Sufficiency rules:
+  SUFFICIENT (true) when:
+    - All numbers/metrics asked for are present in context
+    - Explanation text is present if the question asks "why" or "how"
+    - At least one result was returned (not all errors/empty)
+
+  NOT SUFFICIENT (false) when:
+    - Context is empty or all tool calls returned errors
+    - Question asks for multiple things and only some are answered
+    - Numbers are present but question also needs qualitative explanation (or vice versa)
+    - A comparison question is only half answered (one company missing)
+
+  IMPORTANT: Do NOT say insufficient just because you want more context.
+  If the core question is answered with cited data → sufficient = true.
 
 Respond with ONLY valid JSON:
-{{"sufficient": true|false, "reason": "one sentence"}}"""
+{{"sufficient": true|false, "reason": "one sentence explaining your decision"}}"""
 
 def is_sufficient(question: str, context: str) -> tuple[bool, str]:
     """Returns (sufficient, reason)."""
