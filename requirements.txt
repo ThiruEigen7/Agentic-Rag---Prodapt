@@ -7,5 +7,5 @@ tqdm
 tavily-python
 openpyxl
 pandas
-google-generativeai
+requests
 markdownify

@@ -30,19 +30,23 @@ from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 
-from google import genai
-from google.genai import types
+from groq import Groq
 from dotenv import load_dotenv
 
-from tools import search_docs, query_data, web_search
-from tools.search_docs import detect_company_in_query
+from tools.search_docs import search_docs, detect_company_in_query
+from tools.query_data import query_data
+from tools.web_search import web_search
 
 load_dotenv()
 
 # ── config ────────────────────────────────────────────────────────────────────
-MAX_STEPS     = 8           # hard cap — never change this
-TRACES_DIR    = Path("traces")
-GEMINI_MODEL  = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")   # free tier
+MAX_STEPS      = 8        # hard cap — never change this
+TRACES_DIR     = Path("traces")
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
+# llama-3.3-70b-versatile : best quality, ~30 RPM free
+# llama-3.1-8b-instant    : faster, higher rate limits — use as fallback
+GROQ_MODEL     = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL_FAST= os.getenv("GROQ_MODEL_FAST", "llama-3.1-8b-instant")
 
 COMPANY_KEYWORDS = {
     "infosys"    : "Infosys",
@@ -120,38 +124,81 @@ class AgentResult:
     refusal_reason : str  = ""
 
 
-# ── Gemini client ─────────────────────────────────────────────────────────────
-def _get_client() -> genai.Client:
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if not api_key:
+# ── Groq client ──────────────────────────────────────────────────────────────
+def _get_groq() -> Groq:
+    if not GROQ_API_KEY:
         raise EnvironmentError(
-            "GEMINI_API_KEY not set. Add it to .env file.\n"
-            "Get free key: https://aistudio.google.com/app/apikey"
+            "GROQ_API_KEY not set. Add it to .env file.\n"
+            "Get free key (no credit card): https://console.groq.com/"
         )
-    return genai.Client(api_key=api_key)
+    return Groq(api_key=GROQ_API_KEY)
 
 
-def _llm(prompt: str) -> str:
-    """Single Gemini call. Returns response text stripped of whitespace."""
-    client   = _get_client()
-    response = client.models.generate_content(
-        model    = GEMINI_MODEL,
-        contents = prompt,
-    )
-    return response.text.strip()
-
-
-def _llm_json(prompt: str) -> dict:
+def _llm(prompt: str, max_retries: int = 3, fast: bool = False) -> str:
     """
-    Gemini call expecting JSON output.
-    Strips markdown fences if model adds them despite instructions.
-    Falls back to empty dict on parse failure.
+    Groq API call with automatic fallback to faster model on rate limit.
+    
+    fast=False : uses GROQ_MODEL (llama-3.3-70b-versatile) — best quality
+    fast=True  : uses GROQ_MODEL_FAST (llama-3.1-8b-instant) — higher limits
+    
+    On 429 rate limit: automatically retries with fast model before giving up.
     """
-    raw = _llm(prompt)
+    client = _get_groq()
+    model  = GROQ_MODEL_FAST if fast else GROQ_MODEL
+
+    for attempt in range(max_retries):
+        try:
+            resp = client.chat.completions.create(
+                model       = model,
+                messages    = [{"role": "user", "content": prompt}],
+                temperature = 0.3,
+                max_tokens  = 500,
+            )
+            return resp.choices[0].message.content.strip()
+
+        except Exception as e:
+            err = str(e)
+            is_rate = "429" in err or "rate_limit" in err.lower()
+
+            if is_rate and not fast:
+                # step down to fast model — no wait needed
+                print(f"  ⚡ Rate limit on {model} → switching to {GROQ_MODEL_FAST}", file=sys.stderr)
+                model = GROQ_MODEL_FAST
+                continue
+
+            elif is_rate and attempt < max_retries - 1:
+                wait = 10 * (attempt + 1)   # groq resets per minute: wait 10-20s
+                print(f"  ⏳ Rate limit. Waiting {wait}s ({attempt+1}/{max_retries})", file=sys.stderr)
+                time.sleep(wait)
+                continue
+
+            else:
+                raise
+
+    raise Exception(f"Groq failed after {max_retries} attempts on {model}")
+
+
+def _llm_json(prompt: str, max_retries: int = 3) -> dict:
+    """
+    Groq call expecting JSON output.
+    Strips markdown fences. Falls back to empty dict on parse failure.
+    """
+    raw = _llm(prompt, max_retries=max_retries)
+
     # strip ```json ... ``` fences
-    if raw.startswith("```"):
+    if "```" in raw:
         lines = [l for l in raw.split("\n") if not l.strip().startswith("```")]
         raw   = "\n".join(lines).strip()
+
+    # extract JSON object if model added surrounding text
+    if "{" in raw:
+        try:
+            start = raw.index("{")
+            end   = raw.rindex("}") + 1
+            raw   = raw[start:end]
+        except ValueError:
+            pass
+
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
@@ -346,10 +393,10 @@ def execute_tool(tool: str, tool_input: str, question: str) -> dict:
 # ── loop step ⑤: relevance / sufficiency check ─────────────────────────────
 SUFFICIENCY_PROMPT = """You are checking whether enough information has been collected to answer a question.
 
-QUESTION: {{question}}
+QUESTION: {question}
 
 CONTEXT COLLECTED:
-{{context}}
+{context}
 
 Is the context sufficient to write a complete, accurate, cited answer?
 
@@ -372,7 +419,32 @@ Respond with ONLY valid JSON:
 {{"sufficient": true|false, "reason": "one sentence explaining your decision"}}"""
 
 def is_sufficient(question: str, context: str) -> tuple[bool, str]:
-    """Returns (sufficient, reason)."""
+    """
+    Returns (sufficient, reason).
+    
+    Heuristic: For comparison/numeric questions (comparing companies or metrics),
+    if context contains database results with multiple companies and fiscal years,
+    consider it sufficient.
+    """
+    # heuristic for comparison questions
+    q_lower = question.lower()
+    is_comparison = any(w in q_lower for w in ["compare", "versus", "vs", "differ", "all", "between"])
+    is_numeric = any(w in q_lower for w in ["revenue", "margin", "headcount", "eps", "number"])
+    
+    # if comparison + numeric + context has company entries → likely sufficient
+    if is_comparison and is_numeric:
+        # count company mentions in context
+        infosys_count = context.count("'Infosys'") + context.count('"Infosys"')
+        accenture_count = context.count("'Accenture'") + context.count('"Accenture"')
+        cognizant_count = context.count("'Cognizant'") + context.count('"Cognizant"')
+        total_companies = min(1 if infosys_count > 0 else 0, 1) + min(1 if accenture_count > 0 else 0, 1) + min(1 if cognizant_count > 0 else 0, 1)
+        
+        # if we have 2+ companies with multiple rows
+        total_entries = infosys_count + accenture_count + cognizant_count
+        if total_companies >= 2 and total_entries >= 6:
+            return True, f"Comparison question with data for {total_companies} companies"
+    
+    # fallback to LLM
     result = _llm_json(SUFFICIENCY_PROMPT.format(
         question=question, context=context
     ))
