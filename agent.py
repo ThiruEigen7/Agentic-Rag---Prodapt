@@ -303,7 +303,42 @@ Question: {{question}}"""
 def make_plan(question: str) -> tuple[str, str, str]:
     """
     Returns (plan_text, first_tool, first_input).
+    
+    OVERRIDE: If question explicitly asks for current/live data (stock price, news, etc),
+    prioritize web_search as the first tool, even if it also involves historical data.
     """
+    q_lower = question.lower()
+    
+    # Check if question requires live/current data
+    needs_live_data = any(w in q_lower for w in [
+        "current", "today", "live", "stock price", "analyst rating",
+        "recent", "news", "latest", "right now"
+    ])
+    
+    if needs_live_data:
+        # Extract company name
+        company_match = None
+        for company in ["Infosys", "Accenture", "Cognizant", "CTS", "TCS"]:
+            if company.lower() in q_lower:
+                company_match = company
+                break
+        
+        if "stock price" in q_lower or "price" in q_lower:
+            web_input = f"{company_match or 'IT company'} current stock price"
+        elif "analyst" in q_lower or "rating" in q_lower:
+            web_input = f"{company_match or 'IT company'} analyst rating target"
+        else:
+            web_input = f"{company_match or 'IT company'} latest news"
+        
+        # If also asking for comparison/historical, note that
+        if any(w in q_lower for w in ["compare", "versus", "vs", "revenue", "margin", "fy24", "fy25"]):
+            plan = f"First get current data via web_search, then retrieve historical metrics"
+        else:
+            plan = f"Get current/live data about {company_match or 'the company'}"
+        
+        return plan, "web_search", web_input
+    
+    # Otherwise use LLM to decide
     result     = _llm_json(PLAN_PROMPT.format(DATA_CONTEXT=DATA_CONTEXT, question=question))
     plan       = result.get("plan", "")
     first_tool = result.get("first_tool", "query_data")
@@ -345,12 +380,86 @@ def select_tool(question: str, context: str) -> tuple[str, str]:
     """
     Returns (tool_name, tool_input).
     tool_name can be "DONE" meaning agent has enough to answer.
+    
+    OVERRIDE: If question requires live/current data and context doesn't have
+    web_search results yet, force web_search regardless of LLM decision.
+    
+    Also improves query formulation for query_data to include specific FY asked.
     """
+    q_lower = question.lower()
+    
+    # Keywords indicating live/current data requirement
+    needs_live_data = any(w in q_lower for w in [
+        "current", "today", "live", "stock price", "analyst rating",
+        "recent", "news", "latest", "right now"
+    ])
+    
+    # Check if web_search has already been called
+    has_web_results = "[Step" in context and "web_search" in context and "Result:" in context
+    
+    # If needs live data and web_search hasn't been called yet, force it
+    if needs_live_data and not has_web_results:
+        # Extract company name and create a focused query
+        company_match = None
+        for company in ["Infosys", "Accenture", "Cognizant", "CTS", "TCS"]:
+            if company.lower() in q_lower:
+                company_match = company
+                break
+        
+        if company_match:
+            if "stock price" in q_lower or "price" in q_lower:
+                web_input = f"{company_match} stock price today"
+            elif "analyst" in q_lower or "rating" in q_lower:
+                web_input = f"{company_match} analyst rating"
+            elif "news" in q_lower:
+                web_input = f"{company_match} news latest"
+            else:
+                web_input = f"{company_match} current latest"
+        else:
+            web_input = "IT company latest news stock price"
+        
+        return "web_search", web_input
+    
+    # Otherwise use LLM to decide
     result     = _llm_json(TOOL_SELECT_PROMPT.format(
         DATA_CONTEXT=DATA_CONTEXT, question=question, context=context
     ))
     tool       = result.get("tool", "query_data")
     tool_input = result.get("input", question)
+    
+    # If LLM recommended query_data, improve the input to include specific FY years mentioned
+    if tool == "query_data":
+        # Extract FY years mentioned in the question
+        import re
+        fy_pattern = r'fy\d{1,2}'
+        fy_matches = re.findall(fy_pattern, q_lower)
+        
+        # If question mentions specific FY years, include them in the query
+        if fy_matches:
+            # Normalize FY years (e.g., "fy24" -> "FY24")
+            fy_years = " ".join([m.upper() for m in fy_matches])
+            
+            # Extract company names mentioned
+            company_names = []
+            for company in ["Infosys", "Accenture", "Cognizant", "CTS", "TCS"]:
+                if company.lower() in q_lower:
+                    company_names.append(company)
+            
+            # If companies and FY years found, create a more precise query
+            if company_names:
+                companies_str = ", ".join(company_names)
+                # Extract what metrics are asked for
+                if any(w in q_lower for w in ["revenue"]):
+                    tool_input = f"{companies_str} revenue in {fy_years}"
+                elif any(w in q_lower for w in ["margin"]):
+                    tool_input = f"{companies_str} operating margin in {fy_years}"
+                elif any(w in q_lower for w in ["headcount"]):
+                    tool_input = f"{companies_str} headcount in {fy_years}"
+                elif any(w in q_lower for w in ["eps"]):
+                    tool_input = f"{companies_str} EPS in {fy_years}"
+                else:
+                    tool_input = f"{companies_str} financials in {fy_years}"
+    
     if tool not in ("search_docs", "query_data", "web_search", "DONE"):
         tool = "query_data"
     return tool, tool_input
@@ -422,17 +531,53 @@ def is_sufficient(question: str, context: str) -> tuple[bool, str]:
     """
     Returns (sufficient, reason).
     
-    Heuristic: For comparison/numeric questions (comparing companies or metrics),
-    if context contains database results with multiple companies and fiscal years,
-    consider it sufficient.
+    Heuristic: For queries that need both live data and historical data:
+    - If context has web_search results AND query_data results → ALWAYS sufficient
+    - For pure historical queries with comparison → sufficient if 2+ companies
+    - If question needs live data AND asks about comparison/historical data -> NOT sufficient until both tools called
     """
-    # heuristic for comparison questions
     q_lower = question.lower()
+    
+    # Check if question requires live/current data
+    needs_live_data = any(w in q_lower for w in [
+        "current", "today", "live", "stock price", "analyst rating",
+        "recent", "news", "latest", "right now"
+    ])
+    
+    # Check if question also asks for historical/comparison data
+    also_asks_historical = any(w in q_lower for w in [
+        "compare", "versus", "vs", "revenue", "margin", "fy", "fiscal year",
+        "trend", "differ", "between", "how does", "against"
+    ])
+    
+    # Check what we have in context
+    has_web_results = "[Step" in context and "web_search" in context and "Result:" in context
+    has_query_data = "[Step" in context and "query_data" in context and ("Row" in context or "SQL" in context)
+    has_search_docs = "[Step" in context and "search_docs" in context
+    
+    # CRITICAL: If needs live data AND asks about historical/comparison
+    # → must have BOTH web_search AND (query_data or search_docs)
+    if needs_live_data and also_asks_historical:
+        if has_web_results and (has_query_data or has_search_docs):
+            return True, "Collected both live data (web_search) and historical data"
+        elif has_web_results:
+            return False, "Need historical/comparison data in addition to current stock price"
+        else:
+            return False, "Need current stock price data from web_search"
+    
+    # If needs live data but ONLY asks for live data (no comparison)
+    if needs_live_data and not also_asks_historical:
+        if has_web_results:
+            return True, "Current/live data obtained via web_search"
+        else:
+            return False, "Question requires current/live data — web_search results needed"
+    
+    # heuristic for comparison questions with historical data (no live data needed)
     is_comparison = any(w in q_lower for w in ["compare", "versus", "vs", "differ", "all", "between"])
     is_numeric = any(w in q_lower for w in ["revenue", "margin", "headcount", "eps", "number"])
     
     # if comparison + numeric + context has company entries → likely sufficient
-    if is_comparison and is_numeric:
+    if is_comparison and is_numeric and not needs_live_data:
         # count company mentions in context
         infosys_count = context.count("'Infosys'") + context.count('"Infosys"')
         accenture_count = context.count("'Accenture'") + context.count('"Accenture"')
@@ -444,7 +589,11 @@ def is_sufficient(question: str, context: str) -> tuple[bool, str]:
         if total_companies >= 2 and total_entries >= 6:
             return True, f"Comparison question with data for {total_companies} companies"
     
-    # fallback to LLM
+    # For queries with sufficient data rows, mark as sufficient
+    if has_query_data and ("Row" in context and context.count("Row") >= 5):
+        return True, "Sufficient historical data collected"
+    
+    # Otherwise fallback to LLM
     result = _llm_json(SUFFICIENCY_PROMPT.format(
         question=question, context=context
     ))
