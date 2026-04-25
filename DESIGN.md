@@ -54,3 +54,27 @@ Every tool call is recorded with its original input and raw output. The LLM is f
 
 ### 4. Deterministic Model Fallbacks
 To prevent stalling due to API rate limits, the system detects `429 Too Many Requests` errors and automatically switches to a secondary, faster model (e.g., switching from Llama-3.3-70b to Llama-3.1-8b). This ensures the reasoning process continues even during high-load periods.
+
+---
+
+## 4. Traceability & Response Format
+
+The system is designed for maximum transparency. Every run must produce a structured execution trace in the terminal and save a deep JSON log.
+
+### Terminal Trace Format
+The terminal output follows a strict audit sequence:
+1.  **Step-by-Step Execution**: Prints `Step N: [tool] input='...'` and `result=...` for every action.
+2.  **TOOL CALLED**: A header summarizing all tools used.
+3.  **Numbered Synthesis Block**:
+    -   `1)QUESTION`: The input.
+    -   `2)PLAN`: The reasoning intent.
+    -   `3)FINAL ANSWER`: The response with inline `[tool -> source]` citations.
+    -   `4)CITATIONS`: Numbered list of unique sources.
+    -   `5)OVERALL SCORE`: Confidence metric.
+    -   `6)STEPS`: Efficiency metric (N/8).
+
+### Citation Standards
+The agent is prohibited from using generic citations like "search_docs". It must name the specific resource:
+-   **Structured**: `financials.db (table/row description)`.
+-   **Unstructured**: `[filename].md (section/page)`.
+-   **Web**: `Original Source URL`.

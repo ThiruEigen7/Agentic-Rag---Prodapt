@@ -56,32 +56,28 @@ python scripts/ingest_structure.py    # Builds SQLite financials.db
 ## Running the Agent
 
 ### Command Line Interface
-Run the main agent with any natural language question:
+Run the main agent with any natural language question. By default, the agent will display a full execution trace (Steps taken, Tool results, and Final Synthesis):
 ```bash
 python agent.py "How did Infosys revenue growth in FY24 compare to its headcount trend?"
-```
-
-To see the step-by-step reasoning (the "Trace"):
-```bash
-python agent.py "What is the current stock price of Accenture?" --trace
 ```
 
 ---
 
 ## Evaluation
 
-We include a technical evaluation suite to verify agent performance across different query types (Structured, Unstructured, Web, and Gatekeeping).
+We include a standardized evaluation suite to verify agent performance across different query types (Structured, Unstructured, Web, and Gatekeeping).
 
 ### Running Evaluation
 ```bash
-python evaluate.py
+python run_eval.py
 ```
-This script runs a battery of test cases and validates:
-- **Keywords**: Presence of critical facts in the response.
-- **Status codes**: Ensuring the agent correctly identifies successful vs. refused queries.
-- **Latency**: Tracking performance across the multi-step loop.
+This script runs 7 diverse test cases and validates:
+- **Accuracy**: Presence of critical facts (e.g., correct revenue numbers).
+- **Format**: Adherence to the new multi-part response format.
+- **Traceability**: Verification that the agent calls the correct tools for each category.
+- **Latency**: Real-world timing of the multi-step loops.
 
-Results are saved to `eval_results.json`.
+Detailed evaluation history and an assessment of 20 diverse cases can be found in [EVALUATION_RESULTS.md](EVALUATION_RESULTS.md).
 
 ---
 
