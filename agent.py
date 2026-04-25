@@ -754,6 +754,7 @@ def reflect_and_critique(question: str, answer: str) -> tuple[bool, str]:
 def _estimate_tokens(text: str) -> int:
     """Simple heuristic: chars / 4"""
     return len(str(text)) // 4
+def compose_answer(question: str, context: str) -> str:
     """
     Returns the full formatted answer block including citations and score.
     """
