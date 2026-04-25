@@ -1,0 +1,56 @@
+# Design Document: Agentic Financial RAG
+
+This document outlines the architecture, tool specifications, and safety mechanisms of the Agentic Financial RAG system designed for analyzing Indian IT company financials.
+
+---
+
+## 1. Agent Reasoning Loop (Step-by-Step)
+
+The agent operates as a multi-step autonomous reasoner, moving from raw input to a cited answer through the following stages:
+
+### Phase A: Pre-Processing (Deterministic & Filtered)
+1.  **Query Normalization**: The raw user query is cleaned. Common entity aliases (e.g., "TCS" or "CTS") are mapped to canonical names like "Cognizant" to ensure tool consistency.
+2.  **Gatekeeping**: An LLM-based classifier evaluates the intent. 
+    *   **TRIVIAL**: Answers directly (e.g., "Hello").
+    *   **REFUSE**: Declines out-of-scope or sensitive requests (e.g., "Who won the IPL?" or "Give me stock tips").
+    *   **PROCEED**: Pass-through to the main agent loop.
+
+### Phase B: The Main Execution Loop (Max 8 Iterations)
+The agent maintains a "state" containing the conversation history and previous tool outputs.
+3.  **Instructional Planning**: The agent generates an initial plan based on the available tools.
+4.  **Next-Action Selection**: The LLM analyzes the current state and selects the most appropriate tool or decides to provide the final answer (`DONE`).
+5.  **Tool Execution**: The selected tool logic runs (e.g., executing a SQL query or performing a vector search).
+6.  **Sufficiency Evaluation**: After each tool call, the LLM checks if the accumulated data is sufficient to answer the user's question with high confidence. If not, it loops back to step 4.
+
+### Phase C: Answer Synthesis
+7.  **Final Composition**: Once data is sufficient, the LLM synthesizes a coherent narrative, ensuring all numerical facts are cited from the retrieved context.
+
+---
+
+## 2. Tool Schemas
+
+The agent has access to three specialized tools:
+
+| Tool Name | Description | Input (JSON/Str) | Output (JSON) |
+| :--- | :--- | :--- | :--- |
+| **`query_data`** | **Structured Logic.** Natural Language to SQL converter for numeric data. | `{"question": "string"}` | `{"result": [...], "sql": "query", "source": "db"}` |
+| **`search_docs`** | **Semantic Logic.** FAISS-based vector search over annual report text. | `{"query": "string", "company": "optional"}` | `{"chunks": [{"text": "...", "score": 0.8}, ...]}` |
+| **`web_search`** | **Real-time Logic.** Bridge to Tavily API for news and live stock prices. | `{"query": "string"}` | `{"results": [{"title": "...", "url": "...", "content": "..."}]}` |
+
+---
+
+## 3. Prevention of Infinite Loops & Stalls
+
+To ensure the agent remains performant and doesn't enter "hallucination loops," three layers of protection are implemented:
+
+### 1. The Hard Cap (Token of Safety)
+The core loop is wrapped in a `for` loop with a constant `MAX_STEPS = 8`. If the agent cannot reach a conclusion within 8 tool calls, it is forcibly terminated with a `HardCapExceeded` exception. It then provides a partial answer based on what it found, ensuring the user gets a result even if incomplete.
+
+### 2. Failure-Driven Routing (Avoiding Retries)
+If a tool returns an error or empty results (e.g., a SQL query finds no rows), this status is explicitly fed back into the context. The `Select Tool` prompt instructs the LLM that **repeating a failed query is prohibited**. Instead, the agent must pivot to an alternative source (e.g., if `query_data` fails, try `search_docs`).
+
+### 3. Contextual Progression Tracking
+Every tool call is recorded with its original input and raw output. The LLM is forced to review this "execution trace" at every step. This prevents "state-less stalls" where an agent might ask for the same data twice because it "forgot" it already tried.
+
+### 4. Deterministic Model Fallbacks
+To prevent stalling due to API rate limits, the system detects `429 Too Many Requests` errors and automatically switches to a secondary, faster model (e.g., switching from Llama-3.3-70b to Llama-3.1-8b). This ensures the reasoning process continues even during high-load periods.
