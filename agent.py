@@ -63,24 +63,25 @@ DATA_CONTEXT = """
 AVAILABLE TOOLS AND SCHEMAS:
 
 1. search_docs: Semantic search over unstructured documents.
-   Description: Use this tool to perform semantic search over annual reports and textual documents. It is ideal for answering "why", "how", or strategy-related questions by retrieving qualitative context from MD&A, CEO letters, and risk factors. Use this when you need insights that are not captured in structured numeric tables.
-   Inputs: Natural language query string.
-   Outputs: Top-3 relevant text chunks with source filename and section heading (as page number).
+   Description: Use this tool to perform semantic search over annual reports. CURRENTLY ONLY FY25 REPORTS are available (accenture-fy25.md, infosys-fy25.md, cts-fy25.md). These reports contain qualitative context from MD&A, CEO letters, and risk factors for FY25, but they ALSO include historical performance comparisons to FY24 and FY23. Use this for "why", "how", or strategy questions.
+   Inputs: Natural language query string. 
+   Outputs: Top-3 relevant text chunks with source filename and section heading.
 
 2. query_data: Query the structured financial / stats table.
-   Description: Use this tool to retrieve precise numeric data, metrics, and financial statistics from a structured SQLite database. It can handle SQL queries or natural language questions about revenue, margins, headcount, and EPS. Always use this for factual, quantitative lookups for known fiscal years (FY22-FY25).
+   Description: Use this tool to retrieve precise numeric data from a structured SQLite database. DATA IS AVAILABLE FOR FY22, FY23, FY24, and FY25. It handles SQL or natural language questions about revenue, margins, headcount, and EPS.
    Inputs: A pandas or SQL query, or a natural-language question about the data.
    Outputs: A table or scalar value with column names and row count.
 
 3. web_search: Search the live web for recent information.
-   Description: Use this tool to search the live internet for real-time information, current stock prices, analyst ratings, or news events occurring after FY25. Keep the search query extremely concise. Do NOT use this for historical financial data that is already available in search_docs or query_data.
+   Description: Use this tool to search the live internet for real-time information (e.g. current stock prices) or news occurring AFTER FY25 records were published.
    Inputs: A short search query string (under 10 words).
    Outputs: Top-3 result snippets with URL and publication date.
 
 ROUTING RULES:
-- FY22, FY23, FY24, FY25 EXISTS in search_docs and query_data — always use those first.
-- Only use web_search for live prices, news, or data beyond FY25.
-- "Latest" or "current" financials = FY25 (in database).
+- For NUMBERS for FY22-FY25: Always use query_data first.
+- For WHY/STRATEGY for FY25: Use search_docs.
+- For WHY/STRATEGY for FY24: Use search_docs (searching within FY25 reports for "prior year" or "2024" context).
+- Use web_search only for live stock prices or news beyond FY25.
 """
 
 # ── exceptions ────────────────────────────────────────────────────────────────
@@ -446,13 +447,20 @@ def select_tool(question: str, context: str) -> tuple[str, str]:
     import re
     q_lower = question.lower()
     
-    # ── Rule 1: Force web_search for live/current data ───────────────────────
-    needs_live_data = any(w in q_lower for w in [
-        "current", "today", "live", "stock price", "analyst rating",
-        "recent", "news", "latest", "right now"
-    ])
-    has_web_results = "[Step" in context and "web_search" in context and "Result:" in context
+    # ── State Checks ──
+    has_web_results  = "[Step" in context and "web_search"  in context and "Result:" in context
+    has_query_data   = "[Step" in context and "query_data"  in context and "SQL:"    in context
+    has_search_docs  = "[Step" in context and "search_docs" in context
     
+    # ── Keyword Checks ──
+    is_comparison    = any(w in q_lower for w in ["compare", "versus", "vs", "differ", "between", "both"])
+    needs_live_data  = any(w in q_lower for w in ["current", "today", "live", "stock price", "latest"])
+
+    # ── Override: Force search_docs for comparisons after query_data ──────────
+    if is_comparison and has_query_data and not has_search_docs:
+        return "search_docs", f"Strategic context for {question}"
+    
+    # ── Rule 1: Force web_search for live data ──
     if needs_live_data and not has_web_results:
         company_match = None
         for company in ["Infosys", "Accenture", "Cognizant", "CTS"]:
@@ -461,22 +469,21 @@ def select_tool(question: str, context: str) -> tuple[str, str]:
                 break
         
         if company_match:
-            if "stock price" in q_lower or "price" in q_lower:
-                web_input = f"{company_match} stock price"
-            elif "analyst" in q_lower or "rating" in q_lower:
-                web_input = f"{company_match} analyst rating"
-            elif "news" in q_lower:
-                web_input = f"{company_match} news"
-            else:
-                web_input = f"{company_match} latest"
-        else:
-            web_input = "IT company latest news"
+            if "stock price" in q_lower or "price" in q_lower: web_input = f"{company_match} stock price"
+            elif "analyst" in q_lower or "rating" in q_lower: web_input = f"{company_match} analyst rating"
+            elif "news" in q_lower: web_input = f"{company_match} news"
+            else: web_input = f"{company_match} latest"
+        else: web_input = "IT company latest news"
         
         return "web_search", web_input
     
     # ── Rule 2: query_data error → fallback to search_docs ──────────────────
     if ("NOT_IN_SCHEMA" in context or "ERROR" in context) and "query_data" in context:
-        return "search_docs", question
+        # Generate a reason-seeking query for search_docs
+        metric_hint = "financial performance"
+        if "margin" in q_lower: metric_hint = "operating margins and profitability"
+        elif "revenue" in q_lower: metric_hint = "revenue growth and market demand"
+        return "search_docs", f"What strategic factors or market conditions affected {metric_hint}?"
 
     # ── Rule 3: multi-company comparison → ensure BOTH tools are called ──────
     # "SQL:" tag is always emitted by _format_context for query_data results.
@@ -486,10 +493,13 @@ def select_tool(question: str, context: str) -> tuple[str, str]:
     is_comparison   = any(w in q_lower for w in [
         "compare", "versus", "vs", "differ", "all", "between", "both", "companies"
     ])
-    also_asks_why = any(w in q_lower for w in ["why", "reason", "explain", "how"])
+    also_asks_why = any(w in q_lower for w in ["why", "reason", "explain", "how", "strategy"])
 
     if has_query_data and not has_search_docs and (is_comparison or also_asks_why):
-        return "search_docs", question
+        # Comparison enrichment query — target historical context in FY25 reports
+        year_ctx = "FY24" if "fy24" in q_lower else "prior year"
+        metric_hint = "operating margins and growth" if "margin" in q_lower else "performance"
+        return "search_docs", f"Strategic factors affecting {metric_hint} (including {year_ctx} comparisons)."
 
     # ── Rule 4: de-duplication guard ─────────────────────────────────────────
     # Parse the last tool+input from context to avoid spinning on the same call.
@@ -642,131 +652,48 @@ Respond with ONLY valid JSON:
 def is_sufficient(question: str, context: str) -> tuple[bool, str]:
     """
     Returns (sufficient, reason).
-    
-    Heuristic: For queries that need both live data and historical data:
-    - If context has web_search results AND query_data results → ALWAYS sufficient
-    - For pure historical queries with comparison → sufficient if company data found
-    - If query_data failed/errored and search_docs was called → sufficient for qualitative questions
-    - Special: partial company data (e.g., Infosys but missing TCS) + search_docs → sufficient for comparison
     """
     q_lower = question.lower()
     
-    # Check if question requires live/current data
-    needs_live_data = any(w in q_lower for w in [
-        "current", "today", "live", "stock price", "analyst rating",
-        "recent", "news", "latest", "right now"
-    ])
-    
-    # Check if question also asks for historical/comparison data
-    also_asks_historical = any(w in q_lower for w in [
-        "compare", "versus", "vs", "revenue", "margin", "fy", "fiscal year",
-        "trend", "differ", "between", "how does", "against", "reason", "why"
-    ])
-
-    # Detect how many companies the question is asking about
-    requested_companies = sum(
-        1 for name in ["infosys", "accenture", "cognizant", "tcs", "cts"]
-        if name in q_lower
-    )
-    is_multi_company_q = _is_multi_company_query(question)
-    num_companies_requested = max(requested_companies, 3 if is_multi_company_q and requested_companies == 0 else requested_companies)
-
-    # Check what we have in context
-    # Note: "SQL:" tag is reliably emitted for every query_data call in _format_context.
-    # "Row" (capital R) never appears in context rows (they are plain dict reprs).
+    # ── Check Tools in Context ──
     has_web_results  = "[Step" in context and "web_search"  in context and "Result:" in context
     has_query_data   = "[Step" in context and "query_data"  in context and "SQL:"    in context
     has_search_docs  = "[Step" in context and "search_docs" in context
+    
+    # Check for keywords
+    is_comparison = any(w in q_lower for w in ["compare", "versus", "vs", "differ", "between", "both"])
+    needs_live    = any(w in q_lower for w in ["current", "today", "live", "stock price", "latest"])
+    
+    # ── CRITICAL: Force dual-tool use for comparisons ──
+    if is_comparison and has_query_data and not has_search_docs:
+        return False, "FORCING search_docs for qualitative comparison enrichment"
 
-    # Check if query_data failed with error (missing company, schema issue, etc.)
-    query_data_failed = (
-        "[Step" in context and "query_data" in context
-        and ("ERROR" in context or "NOT_IN_SCHEMA" in context)
-    )
+    if needs_live and not has_web_results:
+        return False, "Need live data from web_search"
 
-    # Count how many distinct companies are present in retrieved context
-    companies_in_context = sum(
-        1 for name in ["Infosys", "Accenture", "Cognizant"]
-        if name in context
-    )
+    # Count companies
+    companies_in_context = sum(1 for name in ["Infosys", "Accenture", "Cognizant"] if name in context)
 
-    # ── Rule: live data + historical comparison → need BOTH sources ───────────
-    if needs_live_data and also_asks_historical:
-        if has_web_results and (has_query_data or has_search_docs):
-            return True, "Collected both live data (web_search) and historical data"
-        elif has_web_results:
-            return False, "Need historical/comparison data in addition to current stock price"
-        else:
-            return False, "Need current stock price data from web_search"
+    # ── Rule: already have both? ──
+    if has_query_data and has_search_docs and companies_in_context >= 1:
+        return True, "Have both numeric and qualitative data"
 
-    # ── Rule: live data only ──────────────────────────────────────────────────
-    if needs_live_data and not also_asks_historical:
-        if has_web_results:
-            return True, "Current/live data obtained via web_search"
-        else:
-            return False, "Question requires current/live data — web_search results needed"
+    # ── Rule: single lookup sufficient? ──
+    if not is_comparison and not needs_live and has_query_data and companies_in_context >= 1:
+        return True, "Sufficient numeric data for single lookup"
 
-    # ── Rule: query_data failed → qualitative fallback via search_docs ────────
-    if query_data_failed and has_search_docs:
-        if any(w in q_lower for w in ["reason", "why", "explain", "margin", "guidance"]):
-            return True, "Search_docs retrieved qualitative explanation (MD&A, rationale)"
-
-    # ── Rule: multi-company comparison questions ──────────────────────────────
-    is_comparison = any(w in q_lower for w in [
-        "compare", "versus", "vs", "differ", "all", "between", "both", "companies"
-    ])
-    is_numeric    = any(w in q_lower for w in ["revenue", "margin", "headcount", "eps", "number"])
-
-    if is_comparison and not needs_live_data:
-        if is_multi_company_q:
-            # Need all 3 companies' data for a full comparison
-            if companies_in_context >= 3 and (has_query_data or has_search_docs):
-                return True, f"All 3 companies present in context — comparison is complete"
-            elif companies_in_context >= 2 and has_query_data and has_search_docs:
-                # Have 2 companies' structured + qualitative context — good enough
-                return True, f"{companies_in_context} companies with both numeric + qualitative data"
-            elif companies_in_context >= 1 and has_query_data and has_search_docs:
-                # Have some structured + qualitative — let LLM decide
-                pass  # fall through to LLM check
-            else:
-                # Missing either structured or qualitative data
-                if has_query_data and not has_search_docs:
-                    return False, "Have numbers but still need qualitative context from search_docs"
-                elif has_search_docs and not has_query_data:
-                    return False, "Have qualitative context but still need numbers from query_data"
-                else:
-                    return False, "Need data from at least one source"
-        elif is_numeric:
-            # Single metric comparison — structured data alone is sufficient
-            infosys_count   = context.count("'Infosys'")   + context.count('"Infosys"')
-            accenture_count = context.count("'Accenture'") + context.count('"Accenture"')
-            cognizant_count = context.count("'Cognizant'") + context.count('"Cognizant"')
-            total_entries   = infosys_count + accenture_count + cognizant_count
-            if total_entries >= 4 or (has_search_docs and companies_in_context >= 1):
-                return True, f"Sufficient numeric comparison data ({total_entries} entries)"
-
-    # ── Rule: enough structured data for non-comparison numeric queries ────────
-    # "Source:" is emitted once per query_data call in _format_context.
-    # "Row" (capital R) never appears in context — rows are plain Python dict reprs.
-    if has_query_data and context.count("Source:") >= 1 and companies_in_context >= 1:
-        return True, "Sufficient historical data collected"
-
-    # ── Fallback: let LLM decide (guarded — network errors must not crash agent) ──
+    # ── Fallback: let LLM decide ──
     try:
+        if not (has_query_data or has_search_docs or has_web_results):
+            return False, "No data collected yet"
+            
         result    = _llm_json(SUFFICIENCY_PROMPT.format(question=question, context=context))
         sufficient = result.get("sufficient", False)
         reason     = result.get("reason", "LLM fallback")
         return bool(sufficient), reason
     except Exception as e:
-        # If the LLM call itself fails (rate-limit, connection error, etc.) we
-        # conservatively say "not sufficient" so the agent keeps trying with the
-        # next tool — unless we already have data from both major sources, in which
-        # case we declare sufficient to avoid burning all 8 steps.
-        if has_query_data and has_search_docs:
-            return True, f"LLM sufficiency check failed ({e}); declaring sufficient (both sources present)"
-        if has_query_data and companies_in_context >= 3:
-            return True, f"LLM sufficiency check failed ({e}); declaring sufficient (all 3 companies in query_data)"
-        return False, f"LLM sufficiency check failed: {e}"
+        if has_query_data or has_search_docs: return True, "LLM failed; using best effort"
+        return False, str(e)
 
 
 # ── loop step ⑥: answer composition ──────────────────────────────────────────
@@ -777,20 +704,28 @@ QUESTION: {question}
 CONTEXT (retrieved from tools):
 {context}
 
-Write a clear, accurate answer using ONLY information present in the context above.
-- Answer the question directly in the first sentence
-- Cite every factual claim: mention the source (tool name + file/URL/table)
-- Do not introduce any information not in the context
-- If numbers, include units (crore INR, %, etc.)
-- Keep it concise — 3 to 6 sentences max
+Write a clear, accurate answer using ONLY information present in the context.
+Follow this format strictly:
 
-Then on a new line write:
-CITATIONS: <comma-separated list of sources used>"""
+3)FINAL ANSWER: Start with the qualitative result. Synthesize BOTH numeric and qualitative data. 
+   - Use numeric data from query_data for precise facts.
+   - Use qualitative data from search_docs to explain trends or strategy.
+   - For every claim, add an inline citation: [tool_name → source_name, specific_detail]. 
 
-def compose_answer(question: str, context: str) -> tuple[str, list[str]]:
+4)CITATIONS: Provide a numbered list naming the exact source used for each claim. 
+   Example: 1. financials.db → Cognizant, Infosys | FY24 (10 rows)
+   (Do NOT include raw row data or record lists here).
+
+5)OVERALL SCORE: Provide a score from 0.0 to 1.0 reflecting confidence.
+
+Rules:
+- Cite tool name AND the specific resource.
+- Use the 3), 4), 5) numbering exactly as the start of each section.
+"""
+
+def compose_answer(question: str, context: str) -> str:
     """
-    Returns (answer_text, citations_list).
-    Uses increased max_tokens so multi-source / multi-company answers are not truncated.
+    Returns the full formatted answer block including citations and score.
     """
     client = _get_groq()
     model  = GROQ_MODEL
@@ -799,24 +734,12 @@ def compose_answer(question: str, context: str) -> tuple[str, list[str]]:
         resp = client.chat.completions.create(
             model       = model,
             messages    = [{"role": "user", "content": prompt}],
-            temperature = 0.3,
-            max_tokens  = 1024,   # larger budget for multi-source answers
+            temperature = 0.1,    # Low temp for high accuracy
+            max_tokens  = 1024,
         )
-        raw = resp.choices[0].message.content.strip()
+        return resp.choices[0].message.content.strip()
     except Exception:
-        # fallback to shared helper (500 tokens)
-        raw = _llm(prompt)
-
-    # split answer from citations
-    if "CITATIONS:" in raw:
-        parts     = raw.split("CITATIONS:", 1)
-        answer    = parts[0].strip()
-        citations = [c.strip() for c in parts[1].split(",") if c.strip()]
-    else:
-        answer    = raw.strip()
-        citations = []
-
-    return answer, citations
+        return _llm(prompt)
 
 
 # ── context builder ───────────────────────────────────────────────────────────
@@ -894,52 +817,41 @@ def _save_trace(result: AgentResult) -> Path:
 
     return trace_file
 
-
 def _print_trace(result: AgentResult) -> None:
-    """Pretty-print the trace to stdout."""
-    sep = "─" * 60
-    print(f"\n{sep}")
-    print(f"Question  : {result.question}")
-    print(f"Rewritten : {result.rewritten_q}")
-    print(f"Plan      : {result.plan}")
-    print(f"Status    : {result.status}")
-    print(sep)
-
+    """Pretty-print the trace to stdout in the project's standard format."""
     for tc in result.tool_calls:
-        print(f"\nStep {tc.step}/{MAX_STEPS} — {tc.tool}")
-        print(f"  Input      : {tc.input}")
-        print(f"  Latency    : {tc.latency_ms}ms")
-        print(f"  Sufficient : {tc.sufficient}")
+        tool_display_input = tc.input
+        if tc.tool == "query_data" and "sql" in tc.output:
+            tool_display_input = tc.output["sql"]
 
+        print(f"Step {tc.step}:tool={tc.tool} input='{tool_display_input}'")
+        
         output = tc.output
         if "error" in output:
-            print(f"  Result     : ERROR — {output['error']}")
+            print(f"result=ERROR: {output['error']}")
         elif tc.tool == "search_docs" and "chunks" in output:
-            for c in output["chunks"]:
-                print(
-                    f"  Result     : [{c.get('company','')}] "
-                    f"{c.get('source','')} p.{c.get('page','?')} "
-                    f"score={c.get('score',0):.3f}"
-                )
+            # Format: [chunk text, source, page]
+            chunks_summary = []
+            for c in output["chunks"][:2]: # summary of first 2
+                text = c.get('text','')[:50].replace('\n', ' ')
+                chunks_summary.append(f"[{text}..., {c.get('source','')}, p.{c.get('page','?')}]")
+            print(f"result={'; '.join(chunks_summary)}")
         elif tc.tool == "query_data":
-            print(f"  SQL        : {output.get('sql','')}")
-            print(f"  Source     : {output.get('source','')}")
+            # Format: result=VALUE (Source)
             res = output.get("result")
-            if isinstance(res, list):
-                for row in res[:5]:
-                    print(f"  Row        : {row}")
+            if isinstance(res, list) and res:
+                row_str = str(res[0])[:100]
+                print(f"result={row_str} ({output.get('source','')})")
             else:
-                print(f"  Value      : {res}")
+                print(f"result={res} ({output.get('source','')})")
         elif tc.tool == "web_search" and "results" in output:
-            for r in output["results"]:
-                print(f"  Result     : {r.get('title','')} — {r.get('url','')}")
+            results_summary = []
+            for r in output["results"][:2]:
+                results_summary.append(f"{r.get('title','')} ({r.get('url','')})")
+            print(f"result={'; '.join(results_summary)}")
 
-    print(f"\n{sep}")
-    print(f"Final Answer:\n{result.final_answer}")
-    print(f"\nCitations: {', '.join(result.citations) if result.citations else 'none'}")
-    print(f"\nSteps used : {result.steps_used} / {MAX_STEPS} max")
-    print(f"Total time : {result.total_time_ms}ms")
-    print(sep)
+    print(f"\n{result.final_answer}")
+    # print(f"Steps used:{result.steps_used}/{MAX_STEPS} max\n")
 
 
 # ── MAIN AGENT LOOP ───────────────────────────────────────────────────────────
@@ -1041,10 +953,19 @@ def run_agent(question: str, verbose: bool = False) -> AgentResult:
 
                 # ── ⑥ answer or loop back ─────────────────────────────────────
                 if sufficient:
-                    # compose final answer
-                    answer, citations      = compose_answer(working_q, context)
-                    result.final_answer   = answer
-                    result.citations      = citations
+                    # compose final answer parts
+                    formatted_content = compose_answer(working_q, context)
+                    
+                    # Assemble the requested final format with space between points
+                    tools_called = ", ".join(sorted(set(tc.tool for tc in tool_calls)))
+                    result.final_answer = (
+                        f"TOOL CALLED: {tools_called}\n\n"
+                        f"1)QUESTION: {question}\n\n"
+                        f"2)PLAN: {result.plan}\n\n"
+                        f"{formatted_content}\n\n"
+                        f"6)STEPS: {step}/{MAX_STEPS} max"
+                    )
+                    
                     result.status         = "ok"
                     result.steps_used     = step
                     break
@@ -1054,32 +975,38 @@ def run_agent(question: str, verbose: bool = False) -> AgentResult:
                     next_tool, next_input = select_tool(working_q, context)
 
                     if next_tool == "DONE":
-                        # LLM says DONE even though sufficiency said no
-                        # trust DONE — compose with what we have
-                        answer, citations    = compose_answer(working_q, context)
-                        result.final_answer  = answer
-                        result.citations     = citations
+                        # composition with what we have
+                        formatted_content = compose_answer(working_q, context)
+                        tools_called = ", ".join(sorted(set(tc.tool for tc in tool_calls)))
+                        result.final_answer = (
+                            f"TOOL CALLED: {tools_called}\n\n"
+                            f"1)QUESTION: {question}\n\n"
+                            f"2)PLAN: {result.plan}\n\n"
+                            f"{formatted_content}\n\n"
+                            f"6)STEPS: {step}/{MAX_STEPS} max"
+                        )
                         result.status        = "ok"
                         result.steps_used    = step
                         break
 
     except HardCapExceeded as e:
-        result.final_answer = (
+        msg = (
             f"I was unable to answer this question within the {MAX_STEPS} "
             f"allowed tool calls. The question may require information not "
-            f"available in the current sources, or may be too broad. "
-            f"Please try a more specific question.\n\nDetails: {e}"
+            f"available in the current sources, or may be too broad.\n\nDetails: {e}"
         )
+        result.final_answer = f"question: {question}\nplan: {result.plan}\n\nFinal Answer: {msg}"
         result.status    = "cap_exceeded"
         result.steps_used = MAX_STEPS
 
     except AgentRefusal as e:
-        result.final_answer = (
+        msg = (
             f"I'm not able to help with that. {e}\n\n"
             f"I can answer factual questions about Infosys, Accenture, and "
             f"Cognizant financials from their annual reports (FY21–FY24), "
             f"or search for recent news about these companies."
         )
+        result.final_answer = f"question: {question}\nplan: N/A (Gatekeeper Refusal)\n\nFinal Answer: {msg}"
         result.status    = "refused"
         result.steps_used = 0
 
@@ -1115,11 +1042,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     question = " ".join(args.question)
-    result   = run_agent(question, verbose=args.trace)
-
-    if not args.trace:
-        # minimal output when not in trace mode
-        print(f"\nAnswer: {result.final_answer}")
-        if result.citations:
-            print(f"\nCitations: {', '.join(result.citations)}")
-        print(f"\n[{result.steps_used} tool calls | {result.total_time_ms}ms | status: {result.status}]")
+    result   = run_agent(question, verbose=True) # Always verbose to show the trace

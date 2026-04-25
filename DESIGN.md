@@ -29,13 +29,13 @@ The agent maintains a "state" containing the conversation history and previous t
 
 ## 2. Tool Schemas
 
-The agent has access to three specialized tools, described here with the exact metadata provided to the LLM:
+The agent has access to three specialized tools:
 
-| Tool Name | LLM-Centric Description | Inputs | Outputs |
+| Tool Name | Description | Input (JSON/Str) | Output (JSON) |
 | :--- | :--- | :--- | :--- |
-| **`search_docs`** | Perform semantic search over annual reports and textual documents. Ideal for "why", "how", or strategy questions by retrieving qualitative context from MD&A, CEO letters, and risk factors. | Natural language query string. | Top-3 relevant text chunks with source filename and section/page reference. |
-| **`query_data`** | Retrieve precise numeric data, metrics, and financial statistics from a structured SQLite database. Handles SQL queries or NL questions about revenue, margins, headcount, and EPS. | SQL/Pandas query or Natural-language question. | Table or scalar value with column names and row count. |
-| **`web_search`** | Search the live internet for real-time information, current stock prices, analyst ratings, or news occurring after FY25. | Short search query string (< 10 words). | Top-3 result snippets with URL and publication date. |
+| **`query_data`** | **Structured Logic.** Natural Language to SQL converter for numeric data. | `{"question": "string"}` | `{"result": [...], "sql": "query", "source": "db"}` |
+| **`search_docs`** | **Semantic Logic.** FAISS-based vector search over annual report text. | `{"query": "string", "company": "optional"}` | `{"chunks": [{"text": "...", "score": 0.8}, ...]}` |
+| **`web_search`** | **Real-time Logic.** Bridge to Tavily API for news and live stock prices. | `{"query": "string"}` | `{"results": [{"title": "...", "url": "...", "content": "..."}]}` |
 
 ---
 
