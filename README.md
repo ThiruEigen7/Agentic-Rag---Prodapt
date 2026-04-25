@@ -1,249 +1,93 @@
-# Agentic RAG — Indian IT Company Financials
+# Agentic Financial RAG (Prodapt)
 
-A fully autonomous LLM reasoning agent that answers complex questions about company financials by integrating three data sources:
+This is an agentic RAG system built to analyze and compare financial data from Indian IT giants (Infosys, Accenture, Cognizant) for FY22–FY25. It uses a multi-step reasoning loop to decompose complex queries into structured SQL lookups, unstructured semantic searches, and live web queries.
 
-- **Unstructured Documents** (markdown annual reports for Infosys, Accenture, Cognizant — FY22–FY25)
-- **Structured Financials** (SQLite database with metrics: revenue, operating margin, headcount, EPS)
-- **Live Web Search** (Tavily API for real-time stock prices, news, analyst ratings)
-
-The agent implements a complete reasoning loop: **query rewrite** → **gate check** → **planning** → **tool selection** → **execution** → **sufficiency check** → **answer composition** (max 8 steps).
+### Why this Corpus?
+We selected **Corporate Financial Reports** over simpler datasets (like IPL or Movies) because:
+1.  **Hybrid Data Requirements**: Successfully answering a question like "Compare the impact of AI on operating margins for Infosys vs Accenture" requires both precision numerical data (SQLite) and thematic extraction from narrative text (Vector DB).
+2.  **Comparative Complexity**: Financial analysis often requires cross-referencing multiple companies and multiple years, which tests the agent's ability to plan multi-step tool calls.
+3.  **High Stakes Accuracy**: Financial data has a clear "ground truth," making it easier to identify hallucinations and evaluate the effectiveness of the reasoning loop.
 
 ---
 
-## Quick Start
+## Technical Architecture
 
-### 1. Clone & Install
+The agent follows a deterministic pre-processing stage followed by an autonomous loop:
+1.  **Query Rewrite**: Normalizes aliases (e.g., "CTS" → "Cognizant") and cleans conversational noise.
+2.  **Gate Check**: A classifier that filters out trivial chat ("Hello"), out-of-scope requests ("Who won the IPL?"), or investment advice.
+3.  **The Loop (Max 8 Steps)**:
+    -   **Planner**: Decides the next tool based on the current context.
+    -   **Executor**: Calls `query_data.py` (NL-to-SQL), `search_docs.py` (FAISS Vector Search), or `web_search.py` (Tavily).
+    -   **Sufficiency Check**: LLM determines if gathered context is enough to answer.
+4.  **Answer Synthesis**: Composes the final response with citations and a full execution trace.
 
+---
+
+## Setup
+
+### 1. Requirements
+Ensure you have Python 3.10+ and the following API keys:
+- **Groq API Key**: For LLM inference (Llama 3.3-70b & 3.1-8b).
+- **Tavily API Key**: For live web search.
+
+### 2. Installation
 ```bash
-git clone https://github.com/ThiruEigen7/Agentic-Rag---Prodapt.git
-cd Agentic-Rag---Prodapt
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 2. Configure Environment
-
+### 3. Configuration
+Create a `.env` file from the template:
 ```bash
 cp .env.example .env
+# Edit .env with your GROQ_API_KEY and TAVILY_API_KEY
 ```
 
-Fill in your `.env` file:
-```ini
-GROQ_API_KEY=your_groq_api_key_here
-GROQ_MODEL=llama-3.3-70b-versatile
-GROQ_MODEL_FAST=llama-3.1-8b-instant
-TAVILY_API_KEY=your_tavily_api_key_here
-```
-
-**Get Free API Keys:**
-- **Groq** (LLM): https://console.groq.com/ (free tier: 30 RPM)
-- **Tavily** (Web Search): https://tavily.com/ (free tier: 1000 calls/month)
-
-### 3. Build Indexes (First Time Only)
-
+### 4. Data Ingestion (Initial Run)
+If the databases and indexes are not present, run:
 ```bash
-# Embed unstructured markdown docs and build FAISS index
-python scripts/ingest_unstructure.py
-
-# Ingest structured financial data into SQLite (if CSV provided)
-python scripts/ingest_structure.py
-```
-
-This creates:
-- `indexes/faiss.index` — vector index for semantic search
-- `indexes/chunks.pkl` — chunk metadata (text, source, company, section)
-- `data/structure/financials.db` — SQLite database with company financials
-
----
-
-## Usage
-
-### Run Individual Tools
-
-#### Search Documents (Semantic Search)
-```bash
-# Search all companies (default)
-python tools/search_docs.py "What is Infosys AI strategy?"
-
-# Search single company
-python tools/search_docs.py "revenue trends" --company Infosys
-
-# Balanced search (compare multiple companies)
-python tools/search_docs.py "operating margin improvement" --balanced
-```
-
-#### Query Structured Data
-```bash
-# Natural language query (LLM converts to SQL)
-python tools/query_data.py "What was Infosys revenue in FY24?"
-python tools/query_data.py "Compare operating margins of all companies in FY24"
-
-# Direct SQL query (bypasses LLM, useful for debugging)
-python tools/query_data.py --sql "SELECT company, fiscal_year, revenue_bn_USD FROM financials WHERE fiscal_year='FY24'"
-```
-
-#### Search Web
-```bash
-python tools/web_search.py "Infosys stock price today"
-python tools/web_search.py "Accenture Q1 FY25 earnings"
-```
-
-### Run the Agent
-
-The agent automatically selects tools based on the question:
-
-```bash
-# Simple fact queries (1-2 steps)
-python agent.py "What was Infosys revenue in FY24?"
-
-# Comparison queries (2-4 steps)
-python agent.py "compare operating margin of infosys and cognizant"
-
-# Multi-source queries (3-5 steps)
-python agent.py "What is Infosys current stock price and how does it compare to their FY24 revenue?"
-
-# Verbose trace output (shows all steps)
-python agent.py "compare revenue trends across all three companies" --trace
+python scripts/ingest_unstructure.py  # Builds FAISS index from MD reports
+python scripts/ingest_structure.py    # Builds SQLite financials.db
 ```
 
 ---
 
-## Architecture
+## Running the Agent
 
-### Data Flow
-```
-User Question
-    ↓
-① Query Rewrite (clean & normalize)
-    ↓
-② Gate Check (trivial / refuse / proceed)
-    ↓
-③ Planning (decide tools & order)
-    ↓
-④ Tool Selection & Execution (max 8 iterations)
-    ├─ search_docs (unstructured, qualitative)
-    ├─ query_data (structured, numeric)
-    └─ web_search (live, real-time)
-    ↓
-⑤ Sufficiency Check (have enough context?)
-    ↓
-⑥ Answer Composition (with citations)
-    ↓
-Final Answer + Trace
+### Command Line Interface
+Run the main agent with any natural language question:
+```bash
+python agent.py "How did Infosys revenue growth in FY24 compare to its headcount trend?"
 ```
 
-### Available Data
-
-| Source | Tool | Companies | Years | Data Type |
-|--------|------|-----------|-------|-----------|
-| Markdown Reports | `search_docs` | Infosys, Accenture, Cognizant | FY22–FY25 | MD&A, strategy, text |
-| SQLite DB | `query_data` | Infosys, Accenture, Cognizant | FY22–FY25 | Revenue, margin, headcount, EPS |
-| Web API | `web_search` | Any company | Real-time | Prices, news, ratings |
-
-**Database Schema** (`financials.db`):
-```sql
-CREATE TABLE financials (
-    company TEXT,              -- 'Infosys', 'Accenture', 'Cognizant'
-    fiscal_year TEXT,          -- 'FY22', 'FY23', 'FY24', 'FY25'
-    quarter TEXT,              -- 'Q1', 'Q2', 'Q3', 'Q4', 'Annual'
-    revenue_bn_USD REAL,       -- Revenue in billion USD
-    op_margin_pct REAL,        -- Operating margin as percentage
-    headcount INTEGER,         -- Total employees
-    epsusd REAL,               -- Earnings per share
-    source_link TEXT,          -- Source URL
-    notes TEXT                 -- Additional notes
-);
+To see the step-by-step reasoning (the "Trace"):
+```bash
+python agent.py "What is the current stock price of Accenture?" --trace
 ```
 
 ---
 
-## Routing Rules (Agent Logic)
+## Evaluation
 
-The agent uses these rules to decide which tool to use:
+We include a technical evaluation suite to verify agent performance across different query types (Structured, Unstructured, Web, and Gatekeeping).
 
-| Question Type | Tool | Reason |
-|---------------|------|--------|
-| "What was Infosys FY24 revenue?" | `query_data` | Numeric historical data |
-| "Why did margins improve?" | `search_docs` | Qualitative explanation from reports |
-| "Compare all three companies" | `query_data` + `search_docs` | Multiple companies, may need both |
-| "Current stock price" | `web_search` | Real-time data, not in historical DB |
-| "What is EPS mean?" | LLM (direct) | General knowledge, no tools needed |
-| "Should I buy Infosys?" | Refuse | Investment advice not supported |
-| "Will revenue grow in FY27?" | Refuse | Prediction beyond available data |
+### Running Evaluation
+```bash
+python evaluate.py
+```
+This script runs a battery of test cases and validates:
+- **Keywords**: Presence of critical facts in the response.
+- **Status codes**: Ensuring the agent correctly identifies successful vs. refused queries.
+- **Latency**: Tracking performance across the multi-step loop.
+
+Results are saved to `eval_results.json`.
 
 ---
 
-## Project Structure
+## Known Failure Modes (Honest Assessment)
 
-```
-Agentic-Rag---Prodapt/
-├── agent.py                    # Main agent loop (752 lines, 8-step max)
-├── tools/
-│   ├── search_docs.py          # Semantic search over FAISS index
-│   ├── query_data.py           # Natural language → SQL on SQLite
-│   ├── web_search.py           # Tavily API wrapper
-│   └── __init__.py
-├── scripts/
-│   ├── ingest_unstructure.py   # Embed markdown docs → FAISS index
-│   ├── ingest_structure.py     # Excel/CSV → SQLite
-│   └── patch_chunks.py         # Utility: repair chunk metadata
-├── data/
-│   ├── unstructure/            # Input: markdown annual reports
-│   │   ├── infosys-fy25.md
-│   │   ├── accenture-fy25.md
-│   │   └── cts-fy25.md (Cognizant)
-│   └── structure/              # Output: SQLite database
-│       └── financials.db
-├── indexes/
-│   ├── faiss.index             # FAISS vector index
-│   └── chunks.pkl              # Chunk metadata + embeddings
-├── traces/
-│   └── YYYYMMDD_HHMMSS.json    # Execution traces (auto-generated)
-├── requirements.txt            # Python dependencies
-├── .env                        # API keys (git-ignored)
-├── .env.example                # Template for .env
-└── README.md                   # This file
-```
-
----
-
-## Dependencies & LLM Stack
-
-### Python Packages (11 total)
-
-| Package | Purpose | Used By |
-|---------|---------|---------|
-| `groq` | LLM API client (Groq) | agent.py, query_data.py |
-| `sentence-transformers` | Embedding model (768-dim) | search_docs.py |
-| `faiss-cpu` | Vector similarity search | search_docs.py, scripts |
-| `tavily-python` | Web search API | web_search.py |
-| `numpy` | Numerical computing | search_docs.py, scripts |
-| `pandas` | Data manipulation | query_data.py, scripts |
-| `python-dotenv` | Environment variables | agent.py, tools |
-| `tqdm` | Progress bars | scripts/ingest_unstructure.py |
-| `openpyxl` | Excel support | scripts/ingest_structure.py |
-| `sqlite3` | SQLite driver | query_data.py (built-in) |
-| `requests` | HTTP support | agent.py |
-
-### Embedding Model
-- **Model**: `nomic-ai/nomic-embed-text-v1.5`
-- **Dimensions**: 768
-- **Type**: Sentence-level embeddings
-- **Source**: HuggingFace (auto-downloaded on first use)
-
-### LLM Configuration
-
-**Primary Model** (best quality):
-- `llama-3.3-70b-versatile` (Groq: 30 RPM free)
-- Used for: gate checks, planning, sufficiency checks, answer composition
-
-**Fallback Model** (rate-limited):
-- `llama-3.1-8b-instant` (Groq: higher limits)
-- Automatically used when primary model rate-limits
-- Used for: SQL generation in query_data.py
-
-**Retry Logic**:
-- Exponential backoff: 10s, 20s, 30s between retries
-- Max 3 attempts per request
-- Automatic model fallback on 429 (rate limit)
+Engineers should be aware of the following limitations:
+1.  **SQL Aggregation Limits**: The NL-to-SQL tool (`query_data.py`) can sometimes hallucinate complex `JOIN` or `LAG()` window functions when calculating YoY growth if the user's question is ambiguous.
+2.  **Vector Search Noise**: In `search_docs.py`, very dense financial documents can lead to "semantic overlap" where the top-k chunks are relevant but don't contain the specific numeric detail requested.
+3.  **Rate Limiting**: The free tiers of Groq and Tavily have tight RPM (Requests Per Minute) limits. The agent includes a fallback mechanism (switching from 70b to 8b models), but hitting these limits can still cause 10-30s latencies.
+4.  **Hallucination in Citations**: While the agent is instructed to only use provided context, it may occasionally "smoothen" numbers from different quarters into a single narrative if the tool outputs are conflicting.
+5.  **Multi-Company Ambiguity**: If you ask "Compare revenue for all companies," the agent might stop after fetching two if it deems the context "sufficient," missing the third.

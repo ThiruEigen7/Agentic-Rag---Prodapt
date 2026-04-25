@@ -75,7 +75,8 @@ AVAILABLE DATA SOURCES:
    Columns   : company, fiscal_year, quarter, revenue_bn_USD, op_margin_pct,
                headcount, epsusd, source_link, notes
    Contains  : revenue (USD billions), operating margin %, headcount,
-               EPS (USD), quarterly and annual breakdowns
+               EPS (USD), quarterly (Q1-Q4) and full-year (quarter='FY') breakdowns
+    NOTE      : full-year row uses quarter='FY' — not 'Annual'
 
 3. web_search — Live Web (real-time):
    Contains  : current stock prices, analyst ratings, news from last 90 days,
@@ -223,18 +224,38 @@ Fiscal years in scope: FY21, FY22, FY23, FY24, FY25
 User question: {question}
 Rewritten query:"""
     try:
-        return _llm(prompt)
+        rewritten = _llm(prompt)
+        # Normalize common company aliases (deterministic post-processing)
+        return _normalize_company_aliases(rewritten)
     except Exception:
-        return question   # fallback: use original if rewrite fails
+        return _normalize_company_aliases(question)   # fallback: use original if rewrite fails
+
+
+def _normalize_company_aliases(text: str) -> str:
+    """Normalize common company aliases to canonical names.
+
+    Maps:
+      - 'TCS' or 'CTS' -> 'Cognizant'
+      - preserves case for other words
+    This is a simple, deterministic replacement to avoid LLM rewrite inconsistencies.
+    """
+    import re
+    if not text:
+        return text
+    # replace standalone TCS or CTS (case-insensitive) with Cognizant
+    text = re.sub(r"\bTCS\b", "Cognizant", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bCTS\b", "Cognizant", text, flags=re.IGNORECASE)
+    return text
 
 
 # ── pre-loop step ②: gate — trivial / refuse / proceed ───────────────────────
 GATE_PROMPT = """You are a classifier for a financial data agent.
+Today's date is {current_date}.
 
 Classify this question into exactly one of three categories:
 
-TRIVIAL  — answerable directly with no data lookup (math, general knowledge, greetings)
-           e.g. "what is 2+2", "what does EPS mean", "hello"
+TRIVIAL  — answerable directly with no data lookup (math, general knowledge, greetings, current date/time)
+           e.g. "what is 2+2", "what does EPS mean", "hello", "what is today's date"
 
 REFUSE   — must be declined: investment advice ("should I buy X"), predictions beyond
            available data (FY26+), or harmful/irrelevant requests
@@ -256,19 +277,26 @@ CRITICAL: The following ALWAYS map to PROCEED:
 Respond with ONLY valid JSON — no markdown, no explanation:
 {{"decision": "TRIVIAL"|"REFUSE"|"PROCEED", "reason": "one sentence"}}
 
-Question: {{question}}"""
+Question: {question}"""
+
 
 def gate_check(question: str) -> tuple[str, str]:
     """
     Returns (decision, reason).
     decision: "TRIVIAL" | "REFUSE" | "PROCEED"
     """
-    result = _llm_json(GATE_PROMPT.format(DATA_CONTEXT=DATA_CONTEXT, question=question))
+    current_date = datetime.now().strftime("%A, %B %d, %Y")
+    result = _llm_json(GATE_PROMPT.format(
+        DATA_CONTEXT=DATA_CONTEXT, 
+        question=question, 
+        current_date=current_date
+    ))
     decision = result.get("decision", "PROCEED").upper()
     reason   = result.get("reason", "")
     if decision not in ("TRIVIAL", "REFUSE", "PROCEED"):
         decision = "PROCEED"
     return decision, reason
+
 
 
 # ── pre-loop step ③: planning ─────────────────────────────────────────────────
@@ -303,46 +331,83 @@ Question: {{question}}"""
 def make_plan(question: str) -> tuple[str, str, str]:
     """
     Returns (plan_text, first_tool, first_input).
-    
-    OVERRIDE: If question explicitly asks for current/live data (stock price, news, etc),
-    prioritize web_search as the first tool, even if it also involves historical data.
+
+    Priority overrides (deterministic, before LLM):
+      1. Live/current data keywords   → web_search first
+      2. Multi-company numeric comparison for known FY years → query_data with all-company input
+      3. Everything else              → LLM decides
     """
+    import re
     q_lower = question.lower()
-    
-    # Check if question requires live/current data
+
+    # ── Override 1: live/current data ────────────────────────────────────────
     needs_live_data = any(w in q_lower for w in [
         "current", "today", "live", "stock price", "analyst rating",
         "recent", "news", "latest", "right now"
     ])
-    
+
     if needs_live_data:
-        # Extract company name
         company_match = None
         for company in ["Infosys", "Accenture", "Cognizant", "CTS", "TCS"]:
             if company.lower() in q_lower:
                 company_match = company
                 break
-        
+
         if "stock price" in q_lower or "price" in q_lower:
             web_input = f"{company_match or 'IT company'} current stock price"
         elif "analyst" in q_lower or "rating" in q_lower:
             web_input = f"{company_match or 'IT company'} analyst rating target"
         else:
             web_input = f"{company_match or 'IT company'} latest news"
-        
-        # If also asking for comparison/historical, note that
+
         if any(w in q_lower for w in ["compare", "versus", "vs", "revenue", "margin", "fy24", "fy25"]):
-            plan = f"First get current data via web_search, then retrieve historical metrics"
+            plan = "First get current data via web_search, then retrieve historical metrics"
         else:
             plan = f"Get current/live data about {company_match or 'the company'}"
-        
+
         return plan, "web_search", web_input
-    
-    # Otherwise use LLM to decide
+
+    # ── Override 2: multi-company numeric comparison with explicit FY year ───
+    # e.g. "Compare margins of all three in FY24" → query_data with all-company input
+    is_multi  = _is_multi_company_query(question)
+    is_numeric = any(w in q_lower for w in ["revenue", "margin", "headcount", "eps"])
+    fy_matches = re.findall(r'fy\d{1,2}', q_lower)
+
+    if is_multi and is_numeric and fy_matches:
+        fy_years = ", ".join(m.upper() for m in fy_matches)
+
+        # Which metric?
+        metric_map = {
+            "revenue": "revenue", "margin": "operating margin",
+            "headcount": "headcount", "eps": "EPS",
+        }
+        metric = "financials"
+        for kw, m in metric_map.items():
+            if kw in q_lower:
+                metric = m
+                break
+
+        # Which companies explicitly named? Fall back to all three.
+        company_names: list[str] = []
+        for c in ["Infosys", "Accenture", "Cognizant", "CTS", "TCS"]:
+            if c.lower() in q_lower:
+                canonical = "Cognizant" if c.lower() in ("tcs", "cts") else c
+                if canonical not in company_names:
+                    company_names.append(canonical)
+        if not company_names:
+            company_names = ["Infosys", "Accenture", "Cognizant"]
+
+        companies_str = ", ".join(company_names)
+        first_input   = f"{companies_str} {metric} for {fy_years}"
+        plan = (f"Fetch {metric} for {companies_str} ({fy_years}) from query_data, "
+                f"then enrich with search_docs for qualitative context.")
+        return plan, "query_data", first_input
+
+    # ── Override 3: LLM decides ───────────────────────────────────────────────
     result     = _llm_json(PLAN_PROMPT.format(DATA_CONTEXT=DATA_CONTEXT, question=question))
     plan       = result.get("plan", "")
     first_tool = result.get("first_tool", "query_data")
-    first_input= result.get("first_input", question)
+    first_input = result.get("first_input", question)
     if first_tool not in ("search_docs", "query_data", "web_search"):
         first_tool = "query_data"
     return plan, first_tool, first_input
@@ -381,27 +446,24 @@ def select_tool(question: str, context: str) -> tuple[str, str]:
     Returns (tool_name, tool_input).
     tool_name can be "DONE" meaning agent has enough to answer.
     
-    OVERRIDE: If question requires live/current data and context doesn't have
-    web_search results yet, force web_search regardless of LLM decision.
-    
-    Also improves query formulation for query_data to include specific FY asked.
+    KEY FEATURES:
+    1. If question requires live/current data → force web_search
+    2. When query_data returned error or no results for requested company → fallback to search_docs
+    3. When user asks for FY data → split into Q1,Q2,Q3,Q4,Annual for full picture
     """
+    import re
     q_lower = question.lower()
     
-    # Keywords indicating live/current data requirement
+    # ── Rule 1: Force web_search for live/current data ───────────────────────
     needs_live_data = any(w in q_lower for w in [
         "current", "today", "live", "stock price", "analyst rating",
         "recent", "news", "latest", "right now"
     ])
-    
-    # Check if web_search has already been called
     has_web_results = "[Step" in context and "web_search" in context and "Result:" in context
     
-    # If needs live data and web_search hasn't been called yet, force it
     if needs_live_data and not has_web_results:
-        # Extract company name and create a focused query
         company_match = None
-        for company in ["Infosys", "Accenture", "Cognizant", "CTS", "TCS"]:
+        for company in ["Infosys", "Accenture", "Cognizant", "CTS"]:
             if company.lower() in q_lower:
                 company_match = company
                 break
@@ -420,49 +482,100 @@ def select_tool(question: str, context: str) -> tuple[str, str]:
         
         return "web_search", web_input
     
-    # Otherwise use LLM to decide
+    # ── Rule 2: query_data error → fallback to search_docs ──────────────────
+    if ("NOT_IN_SCHEMA" in context or "ERROR" in context) and "query_data" in context:
+        return "search_docs", question
+
+    # ── Rule 3: multi-company comparison → ensure BOTH tools are called ──────
+    # "SQL:" tag is always emitted by _format_context for query_data results.
+    # This is more reliable than checking for "Row" (capital R never appears).
+    has_query_data  = "SQL:" in context and "query_data" in context
+    has_search_docs = "search_docs" in context
+    is_comparison   = any(w in q_lower for w in [
+        "compare", "versus", "vs", "differ", "all", "between", "both", "companies"
+    ])
+    also_asks_why = any(w in q_lower for w in ["why", "reason", "explain", "how"])
+
+    if has_query_data and not has_search_docs and (is_comparison or also_asks_why):
+        return "search_docs", question
+
+    # ── Rule 4: de-duplication guard ─────────────────────────────────────────
+    # Parse the last tool+input from context to avoid spinning on the same call.
+    last_tool_in_ctx  = None
+    last_input_in_ctx = None
+    for line in reversed(context.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("[Step") and "—" in stripped:
+            last_tool_in_ctx = stripped.split("—")[-1].strip().rstrip("]")
+        elif stripped.startswith("Input:"):
+            last_input_in_ctx = stripped[len("Input:"):].strip()
+            break
+
+    # ── Rule 5: LLM decides, then enhance with FY + company context ──────────
     result     = _llm_json(TOOL_SELECT_PROMPT.format(
         DATA_CONTEXT=DATA_CONTEXT, question=question, context=context
     ))
     tool       = result.get("tool", "query_data")
     tool_input = result.get("input", question)
-    
-    # If LLM recommended query_data, improve the input to include specific FY years mentioned
+
+    # If LLM is about to repeat the exact same call as last time → advance
+    if tool == last_tool_in_ctx and tool_input == last_input_in_ctx:
+        if tool == "query_data" and not has_search_docs:
+            tool, tool_input = "search_docs", question
+        elif tool == "search_docs" and has_query_data:
+            tool, tool_input = "DONE", ""
+        else:
+            tool, tool_input = "DONE", ""
+
+    # Build a better query_data input covering all companies + FY years
     if tool == "query_data":
-        # Extract FY years mentioned in the question
-        import re
-        fy_pattern = r'fy\d{1,2}'
-        fy_matches = re.findall(fy_pattern, q_lower)
-        
-        # If question mentions specific FY years, include them in the query
+        fy_matches = re.findall(r'fy\d{1,2}', q_lower)
         if fy_matches:
-            # Normalize FY years (e.g., "fy24" -> "FY24")
-            fy_years = " ".join([m.upper() for m in fy_matches])
-            
-            # Extract company names mentioned
-            company_names = []
+            fy_years = [m.upper() for m in fy_matches]
+            company_names: list[str] = []
             for company in ["Infosys", "Accenture", "Cognizant", "CTS", "TCS"]:
                 if company.lower() in q_lower:
-                    company_names.append(company)
-            
-            # If companies and FY years found, create a more precise query
+                    canonical = "Cognizant" if company.lower() in ("tcs", "cts") else company
+                    if canonical not in company_names:
+                        company_names.append(canonical)
+            if not company_names and _is_multi_company_query(question):
+                company_names = ["Infosys", "Accenture", "Cognizant"]
+            metric_map = {
+                "revenue": "revenue", "margin": "operating margin",
+                "headcount": "headcount", "eps": "EPS", "employee": "headcount",
+            }
+            metric_type = "financials"
+            for kw, metric in metric_map.items():
+                if kw in q_lower:
+                    metric_type = metric
+                    break
             if company_names:
-                companies_str = ", ".join(company_names)
-                # Extract what metrics are asked for
-                if any(w in q_lower for w in ["revenue"]):
-                    tool_input = f"{companies_str} revenue in {fy_years}"
-                elif any(w in q_lower for w in ["margin"]):
-                    tool_input = f"{companies_str} operating margin in {fy_years}"
-                elif any(w in q_lower for w in ["headcount"]):
-                    tool_input = f"{companies_str} headcount in {fy_years}"
-                elif any(w in q_lower for w in ["eps"]):
-                    tool_input = f"{companies_str} EPS in {fy_years}"
-                else:
-                    tool_input = f"{companies_str} financials in {fy_years}"
-    
+                tool_input = f"{', '.join(company_names)} {metric_type} for {', '.join(fy_years)}"
+
     if tool not in ("search_docs", "query_data", "web_search", "DONE"):
         tool = "query_data"
     return tool, tool_input
+
+
+# ── helpers for multi-company detection ──────────────────────────────────────
+_MULTI_COMPANY_KEYWORDS = [
+    "compare", "all", "three", "each", "versus", "vs", "both",
+    "companies", "all three", "every company", "which company",
+    "infosys and accenture", "infosys and cognizant", "accenture and cognizant",
+]
+
+def _is_multi_company_query(text: str) -> bool:
+    """Return True if the text appears to span multiple companies."""
+    t = text.lower()
+    # Check for multi-company keywords
+    if any(kw in t for kw in _MULTI_COMPANY_KEYWORDS):
+        return True
+    # Check for 2+ company names explicitly mentioned
+    mentioned = sum(
+        1 for name in ["infosys", "accenture", "cognizant", "cts", "tcs"]
+        if name in t
+    )
+    return mentioned >= 2
 
 
 # ── loop step ④: execute tool ─────────────────────────────────────────────────
@@ -470,21 +583,28 @@ def execute_tool(tool: str, tool_input: str, question: str) -> dict:
     """
     Call the selected tool and return its raw result dict.
     Errors are caught and returned as structured error dicts — never crash.
+
+    For search_docs, routing logic:
+      - multi-company query (question OR tool_input) → balanced=True (top_k per company)
+      - single company mentioned in tool_input       → company= filter
+      - otherwise                                    → standard full-index search
     """
     try:
         if tool == "search_docs":
-            # detect company for targeted search
-            company  = detect_company_in_query(question)
-            balanced = any(
-                w in question.lower()
-                for w in ["compare", "all", "three", "each", "versus", "vs"]
-            )
+            # Multi-company check: look at BOTH the question and the tool_input
+            is_multi = _is_multi_company_query(question) or _is_multi_company_query(tool_input)
+
+            if is_multi:
+                # Balanced retrieval: top_k per company so no company is drowned out
+                return search_docs(tool_input, top_k=2, balanced=True)
+
+            # Single-company: detect from tool_input first (more specific), then question
+            company = detect_company_in_query(tool_input) or detect_company_in_query(question)
             if company:
-                return search_docs(tool_input, top_k=3, company=company)
-            elif balanced:
-                return search_docs(tool_input, top_k=1, balanced=True)
-            else:
-                return search_docs(tool_input, top_k=3)
+                return search_docs(tool_input, top_k=4, company=company)
+
+            # Fallback: generic full-index search
+            return search_docs(tool_input, top_k=4)
 
         elif tool == "query_data":
             return query_data(tool_input)
@@ -533,8 +653,9 @@ def is_sufficient(question: str, context: str) -> tuple[bool, str]:
     
     Heuristic: For queries that need both live data and historical data:
     - If context has web_search results AND query_data results → ALWAYS sufficient
-    - For pure historical queries with comparison → sufficient if 2+ companies
-    - If question needs live data AND asks about comparison/historical data -> NOT sufficient until both tools called
+    - For pure historical queries with comparison → sufficient if company data found
+    - If query_data failed/errored and search_docs was called → sufficient for qualitative questions
+    - Special: partial company data (e.g., Infosys but missing TCS) + search_docs → sufficient for comparison
     """
     q_lower = question.lower()
     
@@ -547,16 +668,37 @@ def is_sufficient(question: str, context: str) -> tuple[bool, str]:
     # Check if question also asks for historical/comparison data
     also_asks_historical = any(w in q_lower for w in [
         "compare", "versus", "vs", "revenue", "margin", "fy", "fiscal year",
-        "trend", "differ", "between", "how does", "against"
+        "trend", "differ", "between", "how does", "against", "reason", "why"
     ])
-    
+
+    # Detect how many companies the question is asking about
+    requested_companies = sum(
+        1 for name in ["infosys", "accenture", "cognizant", "tcs", "cts"]
+        if name in q_lower
+    )
+    is_multi_company_q = _is_multi_company_query(question)
+    num_companies_requested = max(requested_companies, 3 if is_multi_company_q and requested_companies == 0 else requested_companies)
+
     # Check what we have in context
-    has_web_results = "[Step" in context and "web_search" in context and "Result:" in context
-    has_query_data = "[Step" in context and "query_data" in context and ("Row" in context or "SQL" in context)
-    has_search_docs = "[Step" in context and "search_docs" in context
-    
-    # CRITICAL: If needs live data AND asks about historical/comparison
-    # → must have BOTH web_search AND (query_data or search_docs)
+    # Note: "SQL:" tag is reliably emitted for every query_data call in _format_context.
+    # "Row" (capital R) never appears in context rows (they are plain dict reprs).
+    has_web_results  = "[Step" in context and "web_search"  in context and "Result:" in context
+    has_query_data   = "[Step" in context and "query_data"  in context and "SQL:"    in context
+    has_search_docs  = "[Step" in context and "search_docs" in context
+
+    # Check if query_data failed with error (missing company, schema issue, etc.)
+    query_data_failed = (
+        "[Step" in context and "query_data" in context
+        and ("ERROR" in context or "NOT_IN_SCHEMA" in context)
+    )
+
+    # Count how many distinct companies are present in retrieved context
+    companies_in_context = sum(
+        1 for name in ["Infosys", "Accenture", "Cognizant"]
+        if name in context
+    )
+
+    # ── Rule: live data + historical comparison → need BOTH sources ───────────
     if needs_live_data and also_asks_historical:
         if has_web_results and (has_query_data or has_search_docs):
             return True, "Collected both live data (web_search) and historical data"
@@ -564,42 +706,75 @@ def is_sufficient(question: str, context: str) -> tuple[bool, str]:
             return False, "Need historical/comparison data in addition to current stock price"
         else:
             return False, "Need current stock price data from web_search"
-    
-    # If needs live data but ONLY asks for live data (no comparison)
+
+    # ── Rule: live data only ──────────────────────────────────────────────────
     if needs_live_data and not also_asks_historical:
         if has_web_results:
             return True, "Current/live data obtained via web_search"
         else:
             return False, "Question requires current/live data — web_search results needed"
-    
-    # heuristic for comparison questions with historical data (no live data needed)
-    is_comparison = any(w in q_lower for w in ["compare", "versus", "vs", "differ", "all", "between"])
-    is_numeric = any(w in q_lower for w in ["revenue", "margin", "headcount", "eps", "number"])
-    
-    # if comparison + numeric + context has company entries → likely sufficient
-    if is_comparison and is_numeric and not needs_live_data:
-        # count company mentions in context
-        infosys_count = context.count("'Infosys'") + context.count('"Infosys"')
-        accenture_count = context.count("'Accenture'") + context.count('"Accenture"')
-        cognizant_count = context.count("'Cognizant'") + context.count('"Cognizant"')
-        total_companies = min(1 if infosys_count > 0 else 0, 1) + min(1 if accenture_count > 0 else 0, 1) + min(1 if cognizant_count > 0 else 0, 1)
-        
-        # if we have 2+ companies with multiple rows
-        total_entries = infosys_count + accenture_count + cognizant_count
-        if total_companies >= 2 and total_entries >= 6:
-            return True, f"Comparison question with data for {total_companies} companies"
-    
-    # For queries with sufficient data rows, mark as sufficient
-    if has_query_data and ("Row" in context and context.count("Row") >= 5):
+
+    # ── Rule: query_data failed → qualitative fallback via search_docs ────────
+    if query_data_failed and has_search_docs:
+        if any(w in q_lower for w in ["reason", "why", "explain", "margin", "guidance"]):
+            return True, "Search_docs retrieved qualitative explanation (MD&A, rationale)"
+
+    # ── Rule: multi-company comparison questions ──────────────────────────────
+    is_comparison = any(w in q_lower for w in [
+        "compare", "versus", "vs", "differ", "all", "between", "both", "companies"
+    ])
+    is_numeric    = any(w in q_lower for w in ["revenue", "margin", "headcount", "eps", "number"])
+
+    if is_comparison and not needs_live_data:
+        if is_multi_company_q:
+            # Need all 3 companies' data for a full comparison
+            if companies_in_context >= 3 and (has_query_data or has_search_docs):
+                return True, f"All 3 companies present in context — comparison is complete"
+            elif companies_in_context >= 2 and has_query_data and has_search_docs:
+                # Have 2 companies' structured + qualitative context — good enough
+                return True, f"{companies_in_context} companies with both numeric + qualitative data"
+            elif companies_in_context >= 1 and has_query_data and has_search_docs:
+                # Have some structured + qualitative — let LLM decide
+                pass  # fall through to LLM check
+            else:
+                # Missing either structured or qualitative data
+                if has_query_data and not has_search_docs:
+                    return False, "Have numbers but still need qualitative context from search_docs"
+                elif has_search_docs and not has_query_data:
+                    return False, "Have qualitative context but still need numbers from query_data"
+                else:
+                    return False, "Need data from at least one source"
+        elif is_numeric:
+            # Single metric comparison — structured data alone is sufficient
+            infosys_count   = context.count("'Infosys'")   + context.count('"Infosys"')
+            accenture_count = context.count("'Accenture'") + context.count('"Accenture"')
+            cognizant_count = context.count("'Cognizant'") + context.count('"Cognizant"')
+            total_entries   = infosys_count + accenture_count + cognizant_count
+            if total_entries >= 4 or (has_search_docs and companies_in_context >= 1):
+                return True, f"Sufficient numeric comparison data ({total_entries} entries)"
+
+    # ── Rule: enough structured data for non-comparison numeric queries ────────
+    # "Source:" is emitted once per query_data call in _format_context.
+    # "Row" (capital R) never appears in context — rows are plain Python dict reprs.
+    if has_query_data and context.count("Source:") >= 1 and companies_in_context >= 1:
         return True, "Sufficient historical data collected"
-    
-    # Otherwise fallback to LLM
-    result = _llm_json(SUFFICIENCY_PROMPT.format(
-        question=question, context=context
-    ))
-    sufficient = result.get("sufficient", False)
-    reason     = result.get("reason", "")
-    return bool(sufficient), reason
+
+    # ── Fallback: let LLM decide (guarded — network errors must not crash agent) ──
+    try:
+        result    = _llm_json(SUFFICIENCY_PROMPT.format(question=question, context=context))
+        sufficient = result.get("sufficient", False)
+        reason     = result.get("reason", "LLM fallback")
+        return bool(sufficient), reason
+    except Exception as e:
+        # If the LLM call itself fails (rate-limit, connection error, etc.) we
+        # conservatively say "not sufficient" so the agent keeps trying with the
+        # next tool — unless we already have data from both major sources, in which
+        # case we declare sufficient to avoid burning all 8 steps.
+        if has_query_data and has_search_docs:
+            return True, f"LLM sufficiency check failed ({e}); declaring sufficient (both sources present)"
+        if has_query_data and companies_in_context >= 3:
+            return True, f"LLM sufficiency check failed ({e}); declaring sufficient (all 3 companies in query_data)"
+        return False, f"LLM sufficiency check failed: {e}"
 
 
 # ── loop step ⑥: answer composition ──────────────────────────────────────────
@@ -623,8 +798,22 @@ CITATIONS: <comma-separated list of sources used>"""
 def compose_answer(question: str, context: str) -> tuple[str, list[str]]:
     """
     Returns (answer_text, citations_list).
+    Uses increased max_tokens so multi-source / multi-company answers are not truncated.
     """
-    raw = _llm(COMPOSE_PROMPT.format(question=question, context=context))
+    client = _get_groq()
+    model  = GROQ_MODEL
+    prompt = COMPOSE_PROMPT.format(question=question, context=context)
+    try:
+        resp = client.chat.completions.create(
+            model       = model,
+            messages    = [{"role": "user", "content": prompt}],
+            temperature = 0.3,
+            max_tokens  = 1024,   # larger budget for multi-source answers
+        )
+        raw = resp.choices[0].message.content.strip()
+    except Exception:
+        # fallback to shared helper (500 tokens)
+        raw = _llm(prompt)
 
     # split answer from citations
     if "CITATIONS:" in raw:
@@ -666,8 +855,21 @@ def _format_context(tool_calls: list[ToolCall]) -> str:
             parts.append(f"Source: {output.get('source','')}")
             result = output.get("result")
             if isinstance(result, list):
-                for row in result[:10]:   # cap at 10 rows in context
-                    parts.append(f"  {row}")
+                # Sort so FY (full-year) rows appear first — most useful for multi-company comparisons.
+                # Within each company: FY > Q4 > Q3 > Q2 > Q1.
+                _quarter_order = {"FY": 0, "Q4": 1, "Q3": 2, "Q2": 3, "Q1": 4}
+                try:
+                    sorted_rows = sorted(
+                        result,
+                        key=lambda r: (
+                            r.get("company", ""),
+                            _quarter_order.get(r.get("quarter", ""), 9),
+                        ),
+                    )
+                except Exception:
+                    sorted_rows = result
+                for row in sorted_rows[:20]:   # cap raised to 20 for multi-company results
+                    parts.append(f"  Row: {row}")
             else:
                 col = output.get("columns", ["value"])[0]
                 parts.append(f"  {col} = {result}")
@@ -771,16 +973,16 @@ def run_agent(question: str, verbose: bool = False) -> AgentResult:
     result     = AgentResult(question=question, rewritten_q="", plan="")
 
     try:
-        # ── ① query rewrite ───────────────────────────────────────────────────
-        result.rewritten_q = rewrite_query(question)
-        working_q          = result.rewritten_q
-
-        # ── ② gate check ──────────────────────────────────────────────────────
-        decision, reason = gate_check(working_q)
+        # ── ① gate check (on original question) ───────────────────────────────
+        # We check the original question before rewrite so trivial questions 
+        # (e.g. "what is today's date") aren't accidentally "financialized" by the rewriter.
+        decision, reason = gate_check(question)
 
         if decision == "TRIVIAL":
             # answer directly, no tools
+            current_date = datetime.now().strftime("%A, %B %d, %Y")
             result.final_answer = _llm(
+                f"Today's date is {current_date}.\n"
                 f"Answer this question directly and concisely:\n{question}"
             )
             result.status    = "ok"
@@ -791,9 +993,14 @@ def run_agent(question: str, verbose: bool = False) -> AgentResult:
             raise AgentRefusal(reason)
 
         else:
+            # ── ② query rewrite ───────────────────────────────────────────────────
+            result.rewritten_q = rewrite_query(question)
+            working_q          = result.rewritten_q
+
             # ── ③ planning ────────────────────────────────────────────────────
             plan, next_tool, next_input = make_plan(working_q)
             result.plan = plan
+
 
             context    = ""
             tool_calls : list[ToolCall] = []
