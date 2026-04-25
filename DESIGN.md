@@ -16,11 +16,14 @@ The agent operates as a multi-step autonomous reasoner, moving from raw input to
     *   **PROCEED**: Pass-through to the main agent loop.
 
 ### Phase B: The Main Execution Loop (Max 8 Iterations)
-The agent maintains a "state" containing the conversation history and previous tool outputs.
-3.  **Instructional Planning**: The agent generates an initial plan based on the available tools.
-4.  **Next-Action Selection**: The LLM analyzes the current state and selects the most appropriate tool or decides to provide the final answer (`DONE`).
-5.  **Tool Execution**: The selected tool logic runs (e.g., executing a SQL query or performing a vector search).
-6.  **Sufficiency Evaluation**: After each tool call, the LLM checks if the accumulated data is sufficient to answer the user's question with high confidence. If not, it loops back to step 4.
+The agent maintains a **Stateful Context**, a growing string that records every tool call, its specific input (e.g., generated SQL), and its raw output. This loop handles the "missing data" problem through multi-step reasoning:
+
+3.  **Instructional Planning**: Before the first tool call, the agent generates a high-level strategy (the "Plan"). If the query is complex (e.g., a comparison), the planner explicitly schedules multiple tools (e.g., "Get numbers from SQL, then strategy from Vector").
+4.  **Action Selection (The Brain)**: The LLM analyzes the *entire* context of previous steps. It is instructed to never repeat a query that returned "No results." If a tool fails, the selection logic forces a "pivot" to an alternative tool (e.g., switching from SQL to semantic search if a column is missing).
+5.  **Tool Execution**: The selected tool runs autonomously. Structured tools (`query_data`) perform natural-language-to-SQL conversion, while unstructured tools (`search_docs`) perform FAISS vector retrieval.
+6.  **Sufficiency Evaluation (The Gate)**: After *every* step, the agent performs a dual check:
+    *   **Heuristic Guard**: Hardcoded rules ensure comparisons always proceed to qualitative enrichment, even if numeric data is found in Step 1.
+    *   **Reasoning Guard**: The LLM evaluates if the current gathered facts are sufficient to fulfill the "Plan." If not, it returns to Step 4 to select the next action.
 
 ### Phase C: Answer Synthesis
 7.  **Final Composition**: Once data is sufficient, the LLM synthesizes a coherent narrative, ensuring all numerical facts are cited from the retrieved context.
