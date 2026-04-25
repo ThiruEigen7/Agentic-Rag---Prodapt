@@ -12,6 +12,8 @@ We selected **Corporate Financial Reports** over simpler datasets (like IPL or M
 
 ## Technical Architecture
 
+![Agentic RAG Architecture](data/agentic_rag_hand.png)
+
 The agent follows a deterministic pre-processing stage followed by an autonomous loop:
 1.  **Query Rewrite**: Normalizes aliases (e.g., "CTS" → "Cognizant") and cleans conversational noise.
 2.  **Gate Check**: A classifier that filters out trivial chat ("Hello"), out-of-scope requests ("Who won the IPL?"), or investment advice.
