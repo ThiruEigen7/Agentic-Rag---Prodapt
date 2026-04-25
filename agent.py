@@ -60,35 +60,27 @@ COMPANY_KEYWORDS = {
 # Update this block whenever your corpus or DB changes.
 # Every prompt references DATA_CONTEXT so the LLM always knows what's available.
 DATA_CONTEXT = """
-AVAILABLE DATA SOURCES:
+AVAILABLE TOOLS AND SCHEMAS:
 
-1. search_docs — Annual Report PDFs (qualitative text):
-   Companies : Infosys, Accenture, Cognizant
-   Years     : FY22, FY23, FY24, FY25
-   Contains  : MD&A commentary, CEO letters, strategic priorities, business segment
-               descriptions, risk factors, operational highlights, headcount narrative,
-               deal wins, AI/cloud strategy, margin explanation text
+1. search_docs: Semantic search over unstructured documents.
+   Description: Use this tool to perform semantic search over annual reports and textual documents. It is ideal for answering "why", "how", or strategy-related questions by retrieving qualitative context from MD&A, CEO letters, and risk factors. Use this when you need insights that are not captured in structured numeric tables.
+   Inputs: Natural language query string.
+   Outputs: Top-3 relevant text chunks with source filename and section heading (as page number).
 
-2. query_data — Structured Financial Database (numbers):
-   Companies : Infosys, Accenture, Cognizant
-   Years     : FY22, FY23, FY24, FY25
-   Columns   : company, fiscal_year, quarter, revenue_bn_USD, op_margin_pct,
-               headcount, epsusd, source_link, notes
-   Contains  : revenue (USD billions), operating margin %, headcount,
-               EPS (USD), quarterly (Q1-Q4) and full-year (quarter='FY') breakdowns
-    NOTE      : full-year row uses quarter='FY' — not 'Annual'
+2. query_data: Query the structured financial / stats table.
+   Description: Use this tool to retrieve precise numeric data, metrics, and financial statistics from a structured SQLite database. It can handle SQL queries or natural language questions about revenue, margins, headcount, and EPS. Always use this for factual, quantitative lookups for known fiscal years (FY22-FY25).
+   Inputs: A pandas or SQL query, or a natural-language question about the data.
+   Outputs: A table or scalar value with column names and row count.
 
-3. web_search — Live Web (real-time):
-   Contains  : current stock prices, analyst ratings, news from last 90 days,
-               earnings releases beyond FY25, leadership changes, deal announcements
-   Use when  : question asks for "current", "today", "latest", "recent",
-               or any period BEYOND FY25
+3. web_search: Search the live web for recent information.
+   Description: Use this tool to search the live internet for real-time information, current stock prices, analyst ratings, or news events occurring after FY25. Keep the search query extremely concise. Do NOT use this for historical financial data that is already available in search_docs or query_data.
+   Inputs: A short search query string (under 10 words).
+   Outputs: Top-3 result snippets with URL and publication date.
 
 ROUTING RULES:
-- FY22, FY23, FY24, FY25 EXISTS in search_docs and query_data — always use those first
-- "Latest" or "current" financials = FY25 → query_data or search_docs
-- Only use web_search for live prices, news, or data beyond FY25
-- NEVER say data is unavailable for FY22-FY25 — it is in the database
+- FY22, FY23, FY24, FY25 EXISTS in search_docs and query_data — always use those first.
+- Only use web_search for live prices, news, or data beyond FY25.
+- "Latest" or "current" financials = FY25 (in database).
 """
 
 # ── exceptions ────────────────────────────────────────────────────────────────
@@ -326,7 +318,7 @@ MULTI-TOOL STRATEGY:
 Write a 1-2 sentence plan, then output ONLY valid JSON:
 {{"plan": "...", "first_tool": "search_docs"|"query_data"|"web_search", "first_input": "short specific query string"}}
 
-Question: {{question}}"""
+Question: {question}"""
 
 def make_plan(question: str) -> tuple[str, str, str]:
     """
@@ -354,11 +346,11 @@ def make_plan(question: str) -> tuple[str, str, str]:
                 break
 
         if "stock price" in q_lower or "price" in q_lower:
-            web_input = f"{company_match or 'IT company'} current stock price"
+            web_input = f"{company_match or 'IT company'} stock price"
         elif "analyst" in q_lower or "rating" in q_lower:
-            web_input = f"{company_match or 'IT company'} analyst rating target"
+            web_input = f"{company_match or 'IT company'} analyst ratings"
         else:
-            web_input = f"{company_match or 'IT company'} latest news"
+            web_input = f"{company_match or 'IT company'} news"
 
         if any(w in q_lower for w in ["compare", "versus", "vs", "revenue", "margin", "fy24", "fy25"]):
             plan = "First get current data via web_search, then retrieve historical metrics"
@@ -427,10 +419,10 @@ DECISION RULES — follow strictly:
                  Do NOT use web_search for FY22-FY25 data — it is in the database
   DONE         → context already contains a complete answer — stop calling tools
 
-QUESTION: {{question}}
+QUESTION: {question}
 
 CONTEXT COLLECTED SO FAR:
-{{context}}
+{context}
 
 What is the NEXT best tool to call?
 - If context has the answer already → {{"tool": "DONE", "input": ""}}
@@ -470,15 +462,15 @@ def select_tool(question: str, context: str) -> tuple[str, str]:
         
         if company_match:
             if "stock price" in q_lower or "price" in q_lower:
-                web_input = f"{company_match} stock price today"
+                web_input = f"{company_match} stock price"
             elif "analyst" in q_lower or "rating" in q_lower:
                 web_input = f"{company_match} analyst rating"
             elif "news" in q_lower:
-                web_input = f"{company_match} news latest"
+                web_input = f"{company_match} news"
             else:
-                web_input = f"{company_match} current latest"
+                web_input = f"{company_match} latest"
         else:
-            web_input = "IT company latest news stock price"
+            web_input = "IT company latest news"
         
         return "web_search", web_input
     
