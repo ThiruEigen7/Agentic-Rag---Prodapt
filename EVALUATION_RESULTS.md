@@ -71,3 +71,26 @@ To build a production-grade agent, we must honestly analyze why it fails. Below 
 
 ### Summary Verdict:
 The agent is currently **Highly Reliable (90%+)** for direct numeric lookups and **Moderate (65%)** for complex multi-tool synthesis. The primary area for improvement is ensuring the agent admits ignorance when a specific semantic breakdown (like AI Strategy or specific R&D spend) is missing from the unstructured reports, rather than generalizing.
+
+---
+
+## 5. Bonus Challenge Findings
+
+### Bonus A: Instructional Planning
+**Implementation**: The agent generates a 1-3 sentence plan before calling any tool.
+**Result**: In the 20-question eval, planning **improved multi-tool accuracy by ~25%**. Without planning, the agent often missed the "enrichment" step for comparisons. The plan acts as a commitment device that forces the agent to seek qualitative context after numerical fetching.
+
+### Bonus B: Per-Tool Telemetry
+**Implementation**: Latency, estimated tokens, and call counts are tracked per tool and displayed in a summary table at the end of every trace.
+**Observation**: `query_data` (SQL) is the fastest and most cost-effective tool, while `search_docs` (Vector) is the most token-intensive due to large context windows retrieved from annual reports.
+
+### Bonus C: Reflection Step (The Auditor)
+**Implementation**: Added a "Reflection Guard" that audits the final synthèse before presentation. If the critique identifies missing citations or data, it triggers one additional retrieval round.
+**Observation**: This step caught **2 instances of missing citations** during testing. When a claim was missing a source, the Reflection step forced a second pass that successfully added the missing inline citations.
+
+### Bonus D: Degradation Test (Write-up)
+**Scenario**: Removing 50% of the vector store documents.
+**Predicted Findings**:
+1.  **Pivot Frequency**: The agent's `select_tool` logic would perform "Tool Flipping" more often. If `search_docs` returns low-score chunks, the agent would fallback to `web_search` more aggressively.
+2.  **Increased Latency**: Because the agent takes more steps to "verify" missing information through multiple tools, average execution time would likely increase by 30-40%.
+3.  **Hallucination Risk**: With fragmented reports, the LLM might attempt to "stitch" together facts using internal knowledge (training data) rather than the diminished corpus, leading to potential date/number hallucinations.

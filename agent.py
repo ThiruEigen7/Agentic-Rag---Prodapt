@@ -103,6 +103,7 @@ class ToolCall:
     output     : dict       # raw tool return dict
     latency_ms : int        # milliseconds
     sufficient : bool       # did LLM say this is enough to answer?
+    tokens_est : int = 0    # estimated token count
 
 @dataclass
 class AgentResult:
@@ -116,6 +117,7 @@ class AgentResult:
     total_time_ms  : int  = 0
     status         : str  = "ok"   # "ok" | "refused" | "cap_exceeded" | "error"
     refusal_reason : str  = ""
+    telemetry      : dict = field(default_factory=lambda: {"total_tokens": 0, "cost_usd": 0.0, "tool_stats": {}})
 
 
 # ── Groq client ──────────────────────────────────────────────────────────────
@@ -723,7 +725,35 @@ Rules:
 - Use the 3), 4), 5) numbering exactly as the start of each section.
 """
 
-def compose_answer(question: str, context: str) -> str:
+# ── Bonus Challenge C: Reflection Stage ───────────────────────────────────────
+REFLECTION_PROMPT = """You are an Auditor critiquing a financial agent's answer.
+
+USER QUESTION: {question}
+AGENT ANSWER: {answer}
+
+Verify:
+1. Does it directly answer the user's question?
+2. Are all numbers and claims cited with [tool -> source]?
+3. Is it logically consistent?
+
+If the answer is GOOD, respond with: {{"sufficient": true, "critique": "None"}}
+If it is missing data or citations, respond with: {{"sufficient": false, "critique": "Explain what is missing"}}
+
+Respond ONLY with valid JSON.
+"""
+
+def reflect_and_critique(question: str, answer: str) -> tuple[bool, str]:
+    """Let the LLM audit the final answer before presenting to user."""
+    prompt = REFLECTION_PROMPT.format(question=question, answer=answer)
+    try:
+        res = _llm_json(prompt)
+        return bool(res.get("sufficient", True)), res.get("critique", "")
+    except Exception:
+        return True, "" # failure to audit -> default to pass
+
+def _estimate_tokens(text: str) -> int:
+    """Simple heuristic: chars / 4"""
+    return len(str(text)) // 4
     """
     Returns the full formatted answer block including citations and score.
     """
@@ -851,7 +881,32 @@ def _print_trace(result: AgentResult) -> None:
             print(f"result={'; '.join(results_summary)}")
 
     print(f"\n{result.final_answer}")
-    # print(f"Steps used:{result.steps_used}/{MAX_STEPS} max\n")
+
+    # Bonus B: Telemetry Table
+    print("\n" + "="*70)
+    print(f"{'TOOL TELEMETRY':^70}")
+    print("="*70)
+    print(f"{'Tool':<15} {'Calls':<8} {'Latency':<12} {'Est. Tokens':<15} {'Est. Cost (USD)':<15}")
+    print("-" * 70)
+    
+    stats = {}
+    for tc in result.tool_calls:
+        if tc.tool not in stats: stats[tc.tool] = {"calls":0, "lat":0, "tok":0}
+        stats[tc.tool]["calls"] += 1
+        stats[tc.tool]["lat"] += tc.latency_ms
+        stats[tc.tool]["tok"] += getattr(tc, 'tokens_est', 0)
+    
+    total_tok = 0
+    total_cost = 0.0
+    for tool, s in stats.items():
+        cost = (s["tok"] / 1000.0) * 0.0006
+        total_tok += s["tok"]
+        total_cost += cost
+        print(f"{tool:<15} {s['calls']:<8} {s['lat']:>6}ms     {s['tok']:<15} ${cost:.5f}")
+    
+    print("-" * 70)
+    print(f"{'TOTAL':<15} {len(result.tool_calls):<8} {'-':<12} {total_tok:<15} ${total_cost:.5f}")
+    print("="*70 + "\n")
 
 
 # ── MAIN AGENT LOOP ───────────────────────────────────────────────────────────
@@ -928,17 +983,21 @@ def run_agent(question: str, verbose: bool = False) -> AgentResult:
                 output = execute_tool(next_tool, next_input, working_q)
                 ms     = int((time.time() - t0) * 1000)
 
+                # Bonus B: Telemetry (Tokens)
+                t_est  = _estimate_tokens(str(output))
+
                 # update context
-                context = _format_context(
+                context_for_check = _format_context(
                     tool_calls + [ToolCall(
                         step=step, tool=next_tool,
                         input=next_input, output=output,
-                        latency_ms=ms, sufficient=False
+                        latency_ms=ms, sufficient=False,
+                        tokens_est=t_est
                     )]
                 )
 
                 # ── ⑤ sufficiency check ───────────────────────────────────────
-                sufficient, suf_reason = is_sufficient(working_q, context)
+                sufficient, suf_reason = is_sufficient(working_q, context_for_check)
 
                 tc = ToolCall(
                     step       = step,
@@ -947,30 +1006,40 @@ def run_agent(question: str, verbose: bool = False) -> AgentResult:
                     output     = output,
                     latency_ms = ms,
                     sufficient = sufficient,
+                    tokens_est = t_est
                 )
                 tool_calls.append(tc)
                 result.tool_calls = tool_calls
+                context = _format_context(tool_calls) # update global context
 
                 # ── ⑥ answer or loop back ─────────────────────────────────────
                 if sufficient:
                     # compose final answer parts
                     formatted_content = compose_answer(working_q, context)
                     
-                    # Assemble the requested final format with space between points
-                    tools_called = ", ".join(sorted(set(tc.tool for tc in tool_calls)))
-                    result.final_answer = (
-                        f"TOOL CALLED: {tools_called}\n\n"
-                        f"1)QUESTION: {question}\n\n"
-                        f"2)PLAN: {result.plan}\n\n"
-                        f"{formatted_content}\n\n"
-                        f"6)STEPS: {step}/{MAX_STEPS} max"
-                    )
+                    # Bonus C: Reflection Step
+                    is_good, critique = reflect_and_critique(working_q, formatted_content)
                     
-                    result.status         = "ok"
-                    result.steps_used     = step
-                    break
+                    if not is_good and step < MAX_STEPS:
+                        # Fail reflection -> loop back once more with the critique
+                        context += f"\n[SELF-CRITIQUE] Step {step} answer was rejected: {critique}. Need more specific data."
+                        sufficient = False 
+                        # This will trigger the select_tool path below
+                    else:
+                        # Accept or forced stop
+                        tools_called = ", ".join(sorted(set(tc.tool for tc in tool_calls)))
+                        result.final_answer = (
+                            f"TOOL CALLED: {tools_called}\n\n"
+                            f"1)QUESTION: {question}\n\n"
+                            f"2)PLAN: {result.plan}\n\n"
+                            f"{formatted_content}\n\n"
+                            f"6)STEPS: {step}/{MAX_STEPS} max"
+                        )
+                        result.status         = "ok"
+                        result.steps_used     = step
+                        break
 
-                else:
+                if not sufficient:
                     # not sufficient — select next tool
                     next_tool, next_input = select_tool(working_q, context)
 
