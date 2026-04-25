@@ -12,7 +12,7 @@ We selected **Corporate Financial Reports** over simpler datasets (like IPL or M
 
 ## Technical Architecture
 
-![Agentic RAG Architecture](data/agentic_rag_hand.png)
+![Agentic RAG Architecture](data/agentic_rag.png)
 
 The agent follows a deterministic pre-processing stage followed by an autonomous loop:
 1.  **Query Rewrite**: Normalizes aliases (e.g., "CTS" → "Cognizant") and cleans conversational noise.
